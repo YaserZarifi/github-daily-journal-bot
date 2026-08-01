@@ -506,8 +506,20 @@ export default {
             payload = await request.json();
         } catch (err) {
             console.error("Invalid JSON payload:", err);
-            return new Response("OK"); // ack anyway so Telegram doesn't retry
+            return new Response("OK");
         }
+
+        // Guard against Telegram retrying a webhook delivery (same update_id twice)
+        if (payload.update_id !== undefined) {
+            const dedupeKey = `seen-update:${payload.update_id}`;
+            const alreadySeen = await env.JOURNAL_KV.get(dedupeKey);
+            if (alreadySeen) {
+                return new Response("OK");
+            }
+            // Short TTL is enough — Telegram retries happen within seconds/minutes, not days
+            await env.JOURNAL_KV.put(dedupeKey, "1", { expirationTtl: 300 });
+        }
+
         const allowedIds = env.ALLOWED_CHAT_IDS.split(",").map(id => id.trim());
         let currentChatId = null;
 
