@@ -177,11 +177,15 @@ Instructions:
                 const nextCount = parseInt(count) + 1;
                 await env.JOURNAL_KV.put(fileDate, nextCount.toString());
 
-                const fileName = `Journal-${formattedDate.replace(/ /g, '')}-#${nextCount}.txt`;
+                // FIX 1: Removed the '#' to prevent URL fragment truncation
+                const fileName = `Journal-${formattedDate.replace(/ /g, '')}-${nextCount}.txt`;
                 const githubToken = env.GITHUB_TOKEN;
-                const repoUrl = `https://api.github.com/repos/YaserZarifi/daily-dev-journal/contents/${fileName}`;
 
-                await fetch(repoUrl, {
+                // FIX 2: Added encodeURIComponent to safely handle any weird characters in the filename
+                const repoUrl = `https://api.github.com/repos/YaserZarifi/daily-dev-journal/contents/${encodeURIComponent(fileName)}`;
+
+                // FIX 3: Capture the GitHub response
+                const githubResponse = await fetch(repoUrl, {
                     method: "PUT",
                     headers: {
                         "Authorization": `Bearer ${githubToken}`,
@@ -194,17 +198,32 @@ Instructions:
                     })
                 });
 
-                await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        chat_id: currentChatId,
-                        message_id: messageId,
-                        text: `Successfully committed ${fileName} to GitHub!`
-                    })
-                });
+                // FIX 4: Only say success if GitHub actually returns an OK status (200 or 201)
+                if (githubResponse.ok) {
+                    await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            chat_id: currentChatId,
+                            message_id: messageId,
+                            text: `Successfully committed ${fileName} to GitHub!`
+                        })
+                    });
+                } else {
+                    const errorData = await githubResponse.text();
+                    await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            chat_id: currentChatId,
+                            message_id: messageId,
+                            text: `Failed to commit! GitHub responded with an error.`
+                        })
+                    });
+                }
             }
 
+            // This return successfully closes the POST request block!
             return new Response("OK");
         }
 
