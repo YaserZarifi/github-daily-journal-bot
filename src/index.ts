@@ -330,6 +330,43 @@ async function incrementAndGetDailyCount(kv: KVNamespace, dateStr: string): Prom
 }
 
 /**
+ * Calculates the current consecutive-day journaling streak, walking backward
+ * from today (Kabul local time). If today has no entries yet, that's not
+ * counted as a break (the day isn't over) — the streak is based on the last
+ * fully-completed run of days with at least one entry.
+ *
+ * @param {KVNamespace} kv - The Cloudflare KV namespace binding.
+ * @param {Date} now - The reference "current" date/time.
+ * @returns {Promise<number>} The streak length in days.
+ */
+async function calculateStreak(kv: KVNamespace, now: Date): Promise<number> {
+    const MAX_LOOKBACK_DAYS = 3650; // safety cap, ~10 years
+    let streak = 0;
+    let cursor = new Date(now);
+
+    // Today counts toward the streak only if there's already an entry for it.
+    const todayCount = parseInt(await getDailyCount(kv, getKabulDateString(cursor)));
+    if (todayCount > 0) {
+        streak = 1;
+    }
+
+    // Step backward day by day (24h shifts are safe: Kabul doesn't observe DST).
+    cursor = new Date(cursor.getTime() - 86400000);
+
+    for (let i = 0; i < MAX_LOOKBACK_DAYS; i++) {
+        const count = parseInt(await getDailyCount(kv, getKabulDateString(cursor)));
+        if (count > 0) {
+            streak++;
+            cursor = new Date(cursor.getTime() - 86400000);
+        } else {
+            break;
+        }
+    }
+
+    return streak;
+}
+
+/**
  * Appends a committed journal entry to the running list for its week,
  * used later to build a weekly summary.
  */
