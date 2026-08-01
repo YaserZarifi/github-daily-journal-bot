@@ -98,25 +98,64 @@ function getRepoPaths(date: Date, prefix: string, count: number | string = ""): 
 //     });
 // }
 
+const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
+
+/**
+ * Splits text into chunks that fit within Telegram's message length limit,
+ * breaking on newlines where possible to avoid cutting mid-sentence.
+ */
+function splitForTelegram(text: string, maxLength: number = TELEGRAM_MAX_MESSAGE_LENGTH): string[] {
+    if (text.length <= maxLength) return [text];
+
+    const chunks: string[] = [];
+    let remaining = text;
+
+    while (remaining.length > maxLength) {
+        let splitAt = remaining.lastIndexOf("\n", maxLength);
+        if (splitAt <= 0) splitAt = maxLength; // no good newline, hard-cut
+        chunks.push(remaining.slice(0, splitAt));
+        remaining = remaining.slice(splitAt).replace(/^\n/, "");
+    }
+    if (remaining.length > 0) chunks.push(remaining);
+
+    return chunks;
+}
+
+/**
+ * Sends a message to a specific Telegram chat. Automatically splits messages
+ * exceeding Telegram's 4096-character limit into multiple sends.
+ * The reply_markup (inline keyboard), if provided, is only attached to the LAST chunk,
+ * since that's the message the user will actually interact with.
+ *
+ * @returns The message_id of the LAST chunk sent (the one carrying the buttons), or null on failure.
+ */
 async function sendTelegramMessage(token: string, chatId: string, text: string, replyMarkup: any = null): Promise<number | null> {
-    const body: any = { chat_id: chatId, text: text };
-    if (replyMarkup) {
-        body.reply_markup = replyMarkup;
+    const chunks = splitForTelegram(text);
+    let lastMessageId: number | null = null;
+
+    for (let i = 0; i < chunks.length; i++) {
+        const isLastChunk = i === chunks.length - 1;
+        const body: any = { chat_id: chatId, text: chunks[i] };
+        if (isLastChunk && replyMarkup) {
+            body.reply_markup = replyMarkup;
+        }
+
+        const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body)
+        });
+
+        if (!response.ok) {
+            console.error("sendMessage failed:", await response.text());
+            return null;
+        }
+
+        const result: any = await response.json();
+        lastMessageId = result.result?.message_id ?? null;
     }
 
-    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body)
-    });
-
-    if (!response.ok) {
-        console.error("sendMessage failed:", await response.text());
-        return null;
-    }
-
-    const result: any = await response.json();
-    return result.result?.message_id ?? null;
+    return lastMessageId;
 }
 
 /**
