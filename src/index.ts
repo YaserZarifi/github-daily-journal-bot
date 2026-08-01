@@ -264,6 +264,39 @@ async function commitToGitHub(token: string, folderName: string, fileName: strin
     return { success: true };
 }
 
+
+/**
+ * Regenerates the README.md index for a given week folder, listing each day's
+ * entry count so the week is browsable on GitHub without opening every file.
+ */
+async function updateWeekReadme(token: string, kv: KVNamespace, weekFolder: string): Promise<void> {
+    const entries = await getWeeklyEntries(kv, weekFolder);
+
+    // Group entry counts by date
+    const countsByDate = new Map<string, number>();
+    for (const entry of entries) {
+        countsByDate.set(entry.date, (countsByDate.get(entry.date) || 0) + 1);
+    }
+
+    const sortedDates = Array.from(countsByDate.keys()).sort();
+
+    let content = `# ${weekFolder}\n\n`;
+    if (sortedDates.length === 0) {
+        content += "_No entries yet this week._\n";
+    } else {
+        content += "| Date | Entries |\n|------|---------|\n";
+        for (const date of sortedDates) {
+            content += `| ${date} | ${countsByDate.get(date)} |\n`;
+        }
+        content += `\n**Total this week:** ${entries.length}\n`;
+    }
+
+    const result = await commitToGitHub(token, weekFolder, "README.md", `Update README for ${weekFolder}`, content);
+    if (!result.success) {
+        console.error(`Failed to update README for ${weekFolder}:`, result.error);
+    }
+}
+
 /**
  * ==========================================
  * MODULE: STORAGE SERVICES (KV)
@@ -545,6 +578,7 @@ async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env)
         // Only real journal entries feed the weekly summary — not accepted /quote commits
         if (draft.original !== "/quote") {
             await appendWeeklyEntry(env.JOURNAL_KV, finalPaths.weekFolder, finalPaths.fileDate, textToCommit);
+            await updateWeekReadme(env.GITHUB_TOKEN, env.JOURNAL_KV, finalPaths.weekFolder);
         }
     } else {
         console.error("GitHub commit error:", result.error);
@@ -615,6 +649,7 @@ async function runWeeklySummaryTask(env: Env): Promise<void> {
     }
 
     await clearWeeklyEntries(env.JOURNAL_KV, weekFolder);
+    await updateWeekReadme(env.GITHUB_TOKEN, env.JOURNAL_KV, weekFolder); // reflects cleared count, since a new week's tracking starts fresh
 }
 
 
