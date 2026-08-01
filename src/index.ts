@@ -34,6 +34,15 @@ function getISOWeek(year: number, month: number, day: number): { isoYear: number
     return { isoYear: date.getUTCFullYear(), weekNo };
 }
 
+/**
+ * Returns the ISO week folder name (e.g., "2026-W31") for a given date, in Kabul local time.
+ */
+function getWeekFolder(date: Date): string {
+    const fileDate = getKabulDateString(date);
+    const [yearStr, monthStr, dayStr] = fileDate.split('-');
+    const { isoYear, weekNo } = getISOWeek(parseInt(yearStr, 10), parseInt(monthStr, 10), parseInt(dayStr, 10));
+    return `${isoYear}-W${weekNo.toString().padStart(2, '0')}`;
+}
 
 /**
  * Returns a YYYY-MM-DD date string for the given date, computed in Kabul local time.
@@ -56,23 +65,17 @@ function getKabulDateString(date: Date): string {
  * @returns {Object} Structured paths containing folderName, fileName, formattedDate, and fileDate.
  */
 
-function getRepoPaths(date: Date, prefix: string, count: number | string = ""): { folderName: string, fileName: string, formattedDate: string, fileDate: string } {
+
+function getRepoPaths(date: Date, prefix: string, count: number | string = ""): { folderName: string, fileName: string, formattedDate: string, fileDate: string, weekFolder: string } {
     const timeZone = 'Asia/Kabul';
     const dateOptions: Intl.DateTimeFormatOptions = { weekday: 'long', day: 'numeric', month: 'long', timeZone };
     const formattedDate = new Intl.DateTimeFormat('en-GB', dateOptions).format(date);
 
-    // YYYY-MM-DD in Kabul local time
     const fileDate = getKabulDateString(date);
-    const [yearStr, monthStr, dayStr] = fileDate.split('-');
-    const year = parseInt(yearStr, 10);
-    const month = parseInt(monthStr, 10);
-    const day = parseInt(dayStr, 10);
-
     const weekDayName = new Intl.DateTimeFormat('en-GB', { weekday: 'long', timeZone }).format(date);
 
     // Week / Day folder structure: e.g. "2026-W31/Saturday-2026-08-01"
-    const { isoYear, weekNo } = getISOWeek(year, month, day);
-    const weekFolder = `${isoYear}-W${weekNo.toString().padStart(2, '0')}`;
+    const weekFolder = getWeekFolder(date);
     const dayFolder = `${weekDayName}-${fileDate}`;
     const folderName = `${weekFolder}/${dayFolder}`;
 
@@ -80,8 +83,10 @@ function getRepoPaths(date: Date, prefix: string, count: number | string = ""): 
     const suffix = count !== "" ? `-${count}` : "";
     const fileName = `${prefix}-${formattedDate.replace(/ /g, '')}${suffix}.txt`;
 
-    return { folderName, fileName, formattedDate, fileDate };
+    return { folderName, fileName, formattedDate, fileDate, weekFolder };
 }
+
+
 
 /**
  * ==========================================
@@ -291,42 +296,31 @@ async function incrementAndGetDailyCount(kv: KVNamespace, dateStr: string): Prom
 
 }
 
+/**
+ * Appends a committed journal entry to the running list for its week,
+ * used later to build a weekly summary.
+ */
+async function appendWeeklyEntry(kv: KVNamespace, weekFolder: string, dateStr: string, text: string): Promise<void> {
+    const key = `week-entries:${weekFolder}`;
+    const existingRaw = await kv.get(key);
+    const entries: { date: string, text: string }[] = existingRaw ? JSON.parse(existingRaw) : [];
+    entries.push({ date: dateStr, text });
+    await kv.put(key, JSON.stringify(entries), { expirationTtl: 1209600 }); // 14-day safety net
+}
 
 /**
- * Calculates the current consecutive-day journaling streak, walking backward
- * from today (Kabul local time). If today has no entries yet, that's not
- * counted as a break (the day isn't over) — the streak is based on the last
- * fully-completed run of days with at least one entry.
- *
- * @param {KVNamespace} kv - The Cloudflare KV namespace binding.
- * @param {Date} now - The reference "current" date/time.
- * @returns {Promise<number>} The streak length in days.
+ * Retrieves all accumulated entries for a given week.
  */
-async function calculateStreak(kv: KVNamespace, now: Date): Promise<number> {
-    const MAX_LOOKBACK_DAYS = 3650; // safety cap, ~10 years
-    let streak = 0;
-    let cursor = new Date(now);
+async function getWeeklyEntries(kv: KVNamespace, weekFolder: string): Promise<{ date: string, text: string }[]> {
+    const raw = await kv.get(`week-entries:${weekFolder}`);
+    return raw ? JSON.parse(raw) : [];
+}
 
-    // Today counts toward the streak only if there's already an entry for it.
-    const todayCount = parseInt(await getDailyCount(kv, getKabulDateString(cursor)));
-    if (todayCount > 0) {
-        streak = 1;
-    }
-
-    // Step backward day by day (24h shifts are safe: Kabul doesn't observe DST).
-    cursor = new Date(cursor.getTime() - 86400000);
-
-    for (let i = 0; i < MAX_LOOKBACK_DAYS; i++) {
-        const count = parseInt(await getDailyCount(kv, getKabulDateString(cursor)));
-        if (count > 0) {
-            streak++;
-            cursor = new Date(cursor.getTime() - 86400000);
-        } else {
-            break;
-        }
-    }
-
-    return streak;
+/**
+ * Clears accumulated entries for a week, called after the weekly summary is committed.
+ */
+async function clearWeeklyEntries(kv: KVNamespace, weekFolder: string): Promise<void> {
+    await kv.delete(`week-entries:${weekFolder}`);
 }
 
 
@@ -381,7 +375,39 @@ async function generateQuoteWithAI(ai: any): Promise<string> {
         ]
     });
     return response.response;
+
+
+
+
 }
+
+
+
+
+/**
+ * Generates a narrative summary of a week's journal entries.
+ */
+async function summarizeWeekWithAI(ai: any, entries: { date: string, text: string }[]): Promise<string> {
+    const combined = entries.map(e => `[${e.date}]\n${e.text}`).join("\n\n---\n\n");
+
+    const response: any = await ai.run("@cf/meta/llama-4-scout-17b-16e-instruct", {
+        messages: [
+            {
+                role: "system",
+                content: `You are a thoughtful journal assistant. You will be given a series of dated journal entries from one week.
+Write a warm, reflective summary of the week: identify key themes, progress, recurring topics, and notable moments.
+Keep it concise (roughly 150-250 words). Return ONLY the summary, no headers, no preamble.`
+            },
+            { role: "user", content: combined }
+        ]
+    });
+    return response.response;
+}
+
+
+
+
+
 
 /**
  * ==========================================
@@ -402,15 +428,6 @@ async function handleIncomingMessage(originalText: string, chatId: string, env: 
         const paths = getRepoPaths(new Date(), "");
         const count = await getDailyCount(env.JOURNAL_KV, paths.fileDate);
         await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, `📊 You have committed ${count} journal entries today!`);
-        return;
-    }
-
-    // Handle /streak command
-    if (originalText === "/streak") {
-        const streak = await calculateStreak(env.JOURNAL_KV, new Date());
-        const emoji = streak > 0 ? "🔥" : "💤";
-        const dayWord = streak === 1 ? "day" : "days";
-        await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, `${emoji} Current streak: ${streak} ${dayWord}`);
         return;
     }
 
@@ -525,6 +542,10 @@ async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env)
 
     if (result.success) {
         await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Successfully committed to ${finalPaths.folderName}/${finalPaths.fileName}!`);
+        // Only real journal entries feed the weekly summary — not accepted /quote commits
+        if (draft.original !== "/quote") {
+            await appendWeeklyEntry(env.JOURNAL_KV, finalPaths.weekFolder, finalPaths.fileDate, textToCommit);
+        }
     } else {
         console.error("GitHub commit error:", result.error);
         await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Failed to commit! ${result.error ?? "GitHub responded with an error."}`);
@@ -559,6 +580,45 @@ async function runDailyQuoteTask(env: Env): Promise<void> {
         console.error("Daily quote commit failed:", result.error);
     }
 }
+
+
+
+
+/**
+ * Builds and commits a narrative summary of the past week's journal entries.
+ * Runs once a week; clears the accumulated entries afterward so next week starts fresh.
+ * If the commit fails, entries are left in KV so the next run can retry.
+ */
+async function runWeeklySummaryTask(env: Env): Promise<void> {
+    const now = new Date();
+    const weekFolder = getWeekFolder(now);
+    const entries = await getWeeklyEntries(env.JOURNAL_KV, weekFolder);
+
+    if (entries.length === 0) {
+        console.log(`No entries to summarize for week ${weekFolder}, skipping.`);
+        return;
+    }
+
+    const summary = await summarizeWeekWithAI(env.AI, entries);
+
+    const result = await commitToGitHub(
+        env.GITHUB_TOKEN,
+        weekFolder,
+        "Weekly-Summary.txt",
+        `Weekly Summary: ${weekFolder}`,
+        summary
+    );
+
+    if (!result.success) {
+        console.error("Weekly summary commit failed:", result.error);
+        return;
+    }
+
+    await clearWeeklyEntries(env.JOURNAL_KV, weekFolder);
+}
+
+
+
 
 /**
  * Periodically prompts authorized users on Telegram with random journal nudges.
@@ -666,9 +726,12 @@ export default {
      * Entry point for scheduled Cron Triggers.
      */
     async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-        const is11PMTrigger = event.cron === "30 18 * * *"; // 6:30 PM UTC = 11:00 PM Kabul
+        const is11PMTrigger = event.cron === "30 18 * * *"; // 6:30 PM UTC daily = 11:00 PM Kabul
+        const isWeeklySummaryTrigger = event.cron === "30 18 * * 0"; // Sunday only, same local time
 
-        if (is11PMTrigger) {
+        if (isWeeklySummaryTrigger) {
+            await runWeeklySummaryTask(env);
+        } else if (is11PMTrigger) {
             await runDailyQuoteTask(env);
         } else {
             await runRandomPromptTask(env);
