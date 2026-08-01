@@ -36,6 +36,18 @@ function getISOWeek(year: number, month: number, day: number): { isoYear: number
 
 
 /**
+ * Returns a YYYY-MM-DD date string for the given date, computed in Kabul local time.
+ */
+function getKabulDateString(date: Date): string {
+    return new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Kabul',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+    }).format(date);
+}
+
+/**
  * Generates standardized folder and file names based on the current date to prevent repetition.
  *
  * @param {Date} date - The current date object.
@@ -50,7 +62,7 @@ function getRepoPaths(date: Date, prefix: string, count: number | string = ""): 
     const formattedDate = new Intl.DateTimeFormat('en-GB', dateOptions).format(date);
 
     // YYYY-MM-DD in Kabul local time
-    const fileDate = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
+    const fileDate = getKabulDateString(date);
     const [yearStr, monthStr, dayStr] = fileDate.split('-');
     const year = parseInt(yearStr, 10);
     const month = parseInt(monthStr, 10);
@@ -276,7 +288,50 @@ async function incrementAndGetDailyCount(kv: KVNamespace, dateStr: string): Prom
     const nextCount = parseInt(currentCount) + 1;
     await kv.put(dateStr, nextCount.toString());
     return nextCount;
+
 }
+
+
+/**
+ * Calculates the current consecutive-day journaling streak, walking backward
+ * from today (Kabul local time). If today has no entries yet, that's not
+ * counted as a break (the day isn't over) — the streak is based on the last
+ * fully-completed run of days with at least one entry.
+ *
+ * @param {KVNamespace} kv - The Cloudflare KV namespace binding.
+ * @param {Date} now - The reference "current" date/time.
+ * @returns {Promise<number>} The streak length in days.
+ */
+async function calculateStreak(kv: KVNamespace, now: Date): Promise<number> {
+    const MAX_LOOKBACK_DAYS = 3650; // safety cap, ~10 years
+    let streak = 0;
+    let cursor = new Date(now);
+
+    // Today counts toward the streak only if there's already an entry for it.
+    const todayCount = parseInt(await getDailyCount(kv, getKabulDateString(cursor)));
+    if (todayCount > 0) {
+        streak = 1;
+    }
+
+    // Step backward day by day (24h shifts are safe: Kabul doesn't observe DST).
+    cursor = new Date(cursor.getTime() - 86400000);
+
+    for (let i = 0; i < MAX_LOOKBACK_DAYS; i++) {
+        const count = parseInt(await getDailyCount(kv, getKabulDateString(cursor)));
+        if (count > 0) {
+            streak++;
+            cursor = new Date(cursor.getTime() - 86400000);
+        } else {
+            break;
+        }
+    }
+
+    return streak;
+}
+
+
+
+
 
 /**
  * ==========================================
@@ -347,6 +402,15 @@ async function handleIncomingMessage(originalText: string, chatId: string, env: 
         const paths = getRepoPaths(new Date(), "");
         const count = await getDailyCount(env.JOURNAL_KV, paths.fileDate);
         await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, `📊 You have committed ${count} journal entries today!`);
+        return;
+    }
+
+    // Handle /streak command
+    if (originalText === "/streak") {
+        const streak = await calculateStreak(env.JOURNAL_KV, new Date());
+        const emoji = streak > 0 ? "🔥" : "💤";
+        const dayWord = streak === 1 ? "day" : "days";
+        await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, `${emoji} Current streak: ${streak} ${dayWord}`);
         return;
     }
 
