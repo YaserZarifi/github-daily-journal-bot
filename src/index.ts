@@ -219,9 +219,61 @@ async function answerCallbackQuery(token: string, callbackQueryId: string): Prom
  * @param {string} content - The plain text content to commit (will be Base64 encoded).
  * @returns {Promise<boolean>} True if the commit was successful, false otherwise.
  */
-async function commitToGitHub(token: string, folderName: string, fileName: string, message: string, content: string): Promise<{ success: boolean, error?: string }> {
-    const filePath = `${folderName}/${fileName}`;
-    const repoUrl = `https://api.github.com/repos/YaserZarifi/daily-dev-journal/contents/${encodeURIComponent(filePath)}`;
+// async function commitToGitHub(token: string, folderName: string, fileName: string, message: string, content: string): Promise<{ success: boolean, error?: string }> {
+//     // const filePath = `${folderName}/${fileName}`;
+//     // const repoUrl = `https://api.github.com/repos/YaserZarifi/daily-dev-journal/contents/${encodeURIComponent(filePath)}`;
+
+//     const filePath = folderName ? `${folderName}/${fileName}` : fileName;
+//     const encodedPath = filePath.split('/').map(segment => encodeURIComponent(segment)).join('/');
+//     const repoUrl = `https://api.github.com/repos/YaserZarifi/daily-dev-journal/contents/${encodedPath}`;
+
+//     const headers = {
+//         "Authorization": `Bearer ${token}`,
+//         "User-Agent": "Cloudflare-Worker",
+//         "Accept": "application/vnd.github.v3+json"
+//     };
+
+//     // Check if the file already exists, so we can pass its sha for an update
+//     // instead of colliding on a create.
+//     let existingSha: string | undefined;
+//     const getResponse = await fetch(repoUrl, { method: "GET", headers });
+//     if (getResponse.ok) {
+//         const existing: any = await getResponse.json();
+//         existingSha = existing.sha;
+//     } else if (getResponse.status !== 404) {
+//         // Something other than "doesn't exist yet" went wrong (auth, rate limit, etc.)
+//         const errBody = await getResponse.text();
+//         return { success: false, error: `GitHub GET failed (${getResponse.status}): ${errBody}` };
+//     }
+
+//     const putBody: any = {
+//         message: message,
+//         content: btoa(unescape(encodeURIComponent(content)))
+//     };
+//     if (existingSha) {
+//         putBody.sha = existingSha;
+//     }
+
+//     const putResponse = await fetch(repoUrl, {
+//         method: "PUT",
+//         headers: { ...headers, "Content-Type": "application/json" },
+//         body: JSON.stringify(putBody)
+//     });
+
+//     if (!putResponse.ok) {
+//         const errBody = await putResponse.text();
+//         return { success: false, error: `GitHub PUT failed (${putResponse.status}): ${errBody}` };
+//     }
+
+//     return { success: true };
+// }
+
+
+
+async function commitToGitHub(token: string, folderName: string, fileName: string, message: string, content: string, isBase64: boolean = false): Promise<{ success: boolean, error?: string }> {
+    const filePath = folderName ? `${folderName}/${fileName}` : fileName;
+    const encodedPath = filePath.split('/').map(segment => encodeURIComponent(segment)).join('/');
+    const repoUrl = `https://api.github.com/repos/YaserZarifi/daily-dev-journal/contents/${encodedPath}`;
 
     const headers = {
         "Authorization": `Bearer ${token}`,
@@ -229,22 +281,21 @@ async function commitToGitHub(token: string, folderName: string, fileName: strin
         "Accept": "application/vnd.github.v3+json"
     };
 
-    // Check if the file already exists, so we can pass its sha for an update
-    // instead of colliding on a create.
     let existingSha: string | undefined;
     const getResponse = await fetch(repoUrl, { method: "GET", headers });
     if (getResponse.ok) {
         const existing: any = await getResponse.json();
         existingSha = existing.sha;
     } else if (getResponse.status !== 404) {
-        // Something other than "doesn't exist yet" went wrong (auth, rate limit, etc.)
         const errBody = await getResponse.text();
         return { success: false, error: `GitHub GET failed (${getResponse.status}): ${errBody}` };
     }
 
+    const finalContent = isBase64 ? content : btoa(unescape(encodeURIComponent(content)));
+
     const putBody: any = {
         message: message,
-        content: btoa(unescape(encodeURIComponent(content)))
+        content: finalContent
     };
     if (existingSha) {
         putBody.sha = existingSha;
@@ -291,7 +342,11 @@ async function updateWeekReadme(token: string, kv: KVNamespace, weekFolder: stri
         content += `\n**Total this week:** ${entries.length}\n`;
     }
 
-    const result = await commitToGitHub(token, weekFolder, "README.md", `Update README for ${weekFolder}`, content);
+    // const result = await commitToGitHub(token, weekFolder, "README.md", `Update README for ${weekFolder}`, content);
+// Passing an empty string "" places the README at the root of your repo
+    const result = await commitToGitHub(token, "", "README.md", `Update README for ${weekFolder}`, content);
+
+
     if (!result.success) {
         console.error(`Failed to update README for ${weekFolder}:`, result.error);
     }
@@ -410,23 +465,104 @@ async function clearWeeklyEntries(kv: KVNamespace, weekFolder: string): Promise<
  * @param {string} text - The raw journal entry text.
  * @returns {Promise<string>} The refined text.
  */
+// async function refineTextWithAI(ai: any, text: string): Promise<string> {
+//     const response: any = await ai.run("@cf/meta/llama-4-scout-17b-16e-instruct", {
+//         messages: [
+//             {
+//     role: "system",
+//     content: `You are an expert English editor, writer, and translator.
+
+// Your task is to transform the user's text into polished, natural English while preserving the original meaning, intent, personality, and tone.
+
+// Instructions:
+// - Automatically detect the language of the user's input.
+// - If the input is not in English, translate it into fluent, natural English first.
+// - Do not translate word by word. Preserve the intended meaning, emotions, and context.
+// - After translation, improve the text like a professional English editor.
+// - Correct all grammar, spelling, punctuation, and wording errors.
+// - Rewrite awkward or unnatural sentences to sound fluent and natural.
+// - Enrich the writing with better vocabulary and smoother sentence flow where appropriate.
+// - Improve clarity, readability, and coherence.
+// - Preserve the user's original voice instead of replacing it with a generic writing style.
+// - Make the final text sound like it was written by a proficient native English speaker.
+// - Humanize the text. Avoid stereotypical AI-generated writing patterns.
+// - NEVER use em dashes (—) or en dashes (–). Use commas, parentheses, or separate sentences instead.
+// - Avoid repetitive sentence structures.
+// - Avoid cliché AI phrases and overly polished corporate language.
+// - Avoid predictable compare-and-contrast patterns such as "not only... but also", "it's not X, it's Y", "whether... or...", "more than just...", and similar formulas.
+// - Use natural sentence variation and authentic human expression.
+// - Do not add new information, assumptions, or ideas that were not present in the original text.
+// - Keep the original length unless expanding is necessary to improve clarity or readability.
+// - Return ONLY the final improved English text. Do not include explanations, notes, translation labels, quotation marks, or conversational filler.`
+//   },
+//             { role: "user", content: text }
+//         ]
+//     });
+//     return response.response;
+// }
+
+
 async function refineTextWithAI(ai: any, text: string): Promise<string> {
     const response: any = await ai.run("@cf/meta/llama-4-scout-17b-16e-instruct", {
         messages: [
             {
                 role: "system",
-                content: `You are an expert English editor and writer. Your task is to improve the user's text while preserving its original meaning, intent, and tone.
-Instructions:
-- Correct all grammar, spelling, punctuation, and wording errors.
-- Rewrite awkward or unnatural sentences to sound fluent and natural.
-- Preserve the user's voice instead of replacing it with a generic writing style.
-- Return ONLY the improved text with no explanations, quotation marks, or conversational filler.`
+                content: `You are an expert English editor, translator, and visionary Markdown designer.
+
+Your task is to transform the user's raw journal text into a beautifully written and structured Markdown journal entry.
+
+Follow these instructions strictly:
+
+LANGUAGE & TRANSLATION:
+- Automatically detect the language of the user's input.
+- If the input is not English, translate it into natural, fluent English first.
+- Do not translate word by word. Preserve the original meaning, emotions, personality, and context.
+- After translation, refine the text as a professional English writer.
+
+WRITING IMPROVEMENT:
+- Correct all grammar, spelling, punctuation, and phrasing issues.
+- Rewrite awkward sentences to sound natural and human.
+- Improve readability, flow, and emotional impact.
+- Preserve the user's original voice and intention.
+- Make the writing feel personal and authentic, not like generic AI-generated content.
+- Do not invent new facts, experiences, or ideas that are not present in the original text.
+
+MARKDOWN FORMATTING:
+- The final output MUST be pure Markdown format only.
+- Do not include explanations, comments, introductions, or closing messages.
+- Do not wrap the output inside markdown code blocks.
+- Start with a meaningful H3 heading (###) that captures the essence of the journal entry.
+- Use proper Markdown structure with headings, paragraphs, lists, bold, italics, and blockquotes when appropriate.
+- Use **bold** for important insights, achievements, or key concepts.
+- Use *italics* for emotions, reflections, or subtle thoughts.
+- Use blockquotes (>) only for deep realizations, memorable thoughts, or philosophical reflections.
+- Keep the structure clean and suitable for a personal GitHub journal.
+
+STYLE RULES:
+- NEVER use em dashes (—) or en dashes (–). Use commas, periods, parentheses, or separate sentences instead.
+- Avoid cliché AI phrases and robotic wording.
+- Avoid repetitive sentence patterns.
+- Avoid common AI writing formulas such as:
+  - "Not only... but also..."
+  - "It's not X, it's Y"
+  - "More than just..."
+  - "Whether... or..."
+- Avoid excessive motivational language or corporate-style writing.
+- Make the final result feel like it was written by a thoughtful human developer documenting their journey.
+
+OUTPUT REQUIREMENT:
+Return ONLY the final Markdown journal entry.
+The first character of your response must be '#'.`
             },
             { role: "user", content: text }
         ]
     });
+
     return response.response;
 }
+
+
+
 
 /**
  * Generates an inspiring quote on a randomized topic using AI.
@@ -485,6 +621,30 @@ Keep it concise (roughly 150-250 words). Return ONLY the summary, no headers, no
  * ==========================================
  */
 
+
+
+async function getTelegramFileUrl(token: string, fileId: string): Promise<string> {
+    const response = await fetch(`https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`);
+    const data: any = await response.json();
+    return `https://api.telegram.org/file/bot${token}/${data.result.file_path}`;
+}
+
+async function downloadTelegramFileAsBase64(url: string): Promise<string> {
+    const response = await fetch(url);
+    const buffer = await response.arrayBuffer();
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const chunk = 8192;
+    for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunk)));
+    }
+    return btoa(binary);
+}
+
+
+
+
+
 /**
  * Handles incoming text messages and commands from Telegram.
  *
@@ -492,8 +652,74 @@ Keep it concise (roughly 150-250 words). Return ONLY the summary, no headers, no
  * @param {string} chatId - The ID of the Telegram chat.
  * @param {Env} env - Environment variables.
  */
-async function handleIncomingMessage(originalText: string, chatId: string, env: Env): Promise<void> {
-    // Handle /stats command
+// async function handleIncomingMessage(originalText: string, chatId: string, env: Env): Promise<void> {
+//     // Handle /stats command
+//     if (originalText === "/stats") {
+//         const paths = getRepoPaths(new Date(), "");
+//         const count = await getDailyCount(env.JOURNAL_KV, paths.fileDate);
+//         await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, `📊 You have committed ${count} journal entries today!`);
+//         return;
+//     }
+
+//     // Handle /quote command
+//     if (originalText === "/quote") {
+//         const quoteText = await generateQuoteWithAI(env.AI);
+//         const messageToSend = `Original:\n/quote\n\nRefined:\n${quoteText}`;
+
+//         const messageId = await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageToSend, {
+//             inline_keyboard: [
+//                 [{ text: "Accept", callback_data: "commit_refined" }],
+//                 [{ text: "Reject", callback_data: "reject" }]
+//             ]
+//         });
+
+//         if (messageId) {
+//             await env.JOURNAL_KV.put(
+//                 `draft:${chatId}:${messageId}`,
+//                 JSON.stringify({ original: "/quote", refined: quoteText }),
+//                 { expirationTtl: 86400 }
+//             );
+//         }
+//         return;
+//     }
+
+//     // Handle /streak command
+//     if (originalText === "/streak") {
+//         const streak = await calculateStreak(env.JOURNAL_KV, new Date());
+//         const emoji = streak > 0 ? "🔥" : "💤";
+//         const dayWord = streak === 1 ? "day" : "days";
+//         await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, `${emoji} Current streak: ${streak} ${dayWord}`);
+//         return;
+//     }
+
+//     // Handle Standard Journal Entry
+//     const refinedText = await refineTextWithAI(env.AI, originalText);
+//     const messageToSend = `Original:\n${originalText}\n\nRefined:\n${refinedText}`;
+
+//     const messageId = await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageToSend, {
+//         inline_keyboard: [
+//             [
+//                 { text: "Accept", callback_data: "commit_refined" },
+//                 { text: "Commit Original", callback_data: "commit_original" }
+//             ],
+//             [{ text: "Reject", callback_data: "reject" }]
+//         ]
+//     });
+
+//     if (messageId) {
+//         await env.JOURNAL_KV.put(
+//             `draft:${chatId}:${messageId}`,
+//             JSON.stringify({ original: originalText, refined: refinedText }),
+//             { expirationTtl: 86400 }
+//         );
+//     }
+// }
+
+
+
+async function handleIncomingMessage(payloadMessage: any, chatId: string, env: Env): Promise<void> {
+    const originalText = payloadMessage.text || payloadMessage.caption || "A visual moment captured.";
+
     if (originalText === "/stats") {
         const paths = getRepoPaths(new Date(), "");
         const count = await getDailyCount(env.JOURNAL_KV, paths.fileDate);
@@ -501,7 +727,6 @@ async function handleIncomingMessage(originalText: string, chatId: string, env: 
         return;
     }
 
-    // Handle /quote command
     if (originalText === "/quote") {
         const quoteText = await generateQuoteWithAI(env.AI);
         const messageToSend = `Original:\n/quote\n\nRefined:\n${quoteText}`;
@@ -523,7 +748,6 @@ async function handleIncomingMessage(originalText: string, chatId: string, env: 
         return;
     }
 
-    // Handle /streak command
     if (originalText === "/streak") {
         const streak = await calculateStreak(env.JOURNAL_KV, new Date());
         const emoji = streak > 0 ? "🔥" : "💤";
@@ -532,7 +756,11 @@ async function handleIncomingMessage(originalText: string, chatId: string, env: 
         return;
     }
 
-    // Handle Standard Journal Entry
+    let fileId = null;
+    if (payloadMessage.photo && payloadMessage.photo.length > 0) {
+        fileId = payloadMessage.photo[payloadMessage.photo.length - 1].file_id;
+    }
+
     const refinedText = await refineTextWithAI(env.AI, originalText);
     const messageToSend = `Original:\n${originalText}\n\nRefined:\n${refinedText}`;
 
@@ -549,7 +777,7 @@ async function handleIncomingMessage(originalText: string, chatId: string, env: 
     if (messageId) {
         await env.JOURNAL_KV.put(
             `draft:${chatId}:${messageId}`,
-            JSON.stringify({ original: originalText, refined: refinedText }),
+            JSON.stringify({ original: originalText, refined: refinedText, fileId: fileId }),
             { expirationTtl: 86400 }
         );
     }
@@ -562,6 +790,64 @@ async function handleIncomingMessage(originalText: string, chatId: string, env: 
  * @param {string} chatId - The ID of the Telegram chat.
  * @param {Env} env - Environment variables.
  */
+// async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env): Promise<void> {
+//     const messageId = callbackQuery.message.message_id;
+//     const data = callbackQuery.data;
+//     const draftKey = `draft:${chatId}:${messageId}`;
+
+//     await answerCallbackQuery(env.TELEGRAM_TOKEN, callbackQuery.id);
+
+//     if (data === "reject") {
+//         await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, "Entry rejected and discarded.");
+//         await env.JOURNAL_KV.delete(draftKey);
+//         return;
+//     }
+
+//     const draftRaw = await env.JOURNAL_KV.get(draftKey);
+//     if (!draftRaw) {
+//         await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, "This entry expired or was already processed.");
+//         return;
+//     }
+//     const draft = JSON.parse(draftRaw);
+
+//     let textToCommit = "";
+//     if (data === "commit_refined") {
+//         textToCommit = draft.refined;
+//     } else if (data === "commit_original") {
+//         textToCommit = draft.original;
+//     }
+
+//     // Prepare GitHub Commit parameters using Utilities
+//     const now = new Date();
+//     const paths = getRepoPaths(now, "Journal"); // Temporary call to get fileDate
+
+//     // Increment daily count and generate definitive paths
+//     const nextCount = await incrementAndGetDailyCount(env.JOURNAL_KV, paths.fileDate);
+//     const finalPaths = getRepoPaths(now, "Journal", `${nextCount}-${messageId}`);
+
+//     const result = await commitToGitHub(
+//         env.GITHUB_TOKEN,
+//         finalPaths.folderName,
+//         finalPaths.fileName,
+//         `Journal Entry: ${finalPaths.formattedDate}`,
+//         textToCommit
+//     );
+
+//     if (result.success) {
+//         await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Successfully committed to ${finalPaths.folderName}/${finalPaths.fileName}!`);
+//         // Only real journal entries feed the weekly summary — not accepted /quote commits
+//         if (draft.original !== "/quote") {
+//             await appendWeeklyEntry(env.JOURNAL_KV, finalPaths.weekFolder, finalPaths.fileDate, textToCommit);
+//             await updateWeekReadme(env.GITHUB_TOKEN, env.JOURNAL_KV, finalPaths.weekFolder);
+//         }
+//     } else {
+//         console.error("GitHub commit error:", result.error);
+//         await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Failed to commit! ${result.error ?? "GitHub responded with an error."}`);
+//     }
+//     await env.JOURNAL_KV.delete(draftKey);
+// }
+
+
 async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env): Promise<void> {
     const messageId = callbackQuery.message.message_id;
     const data = callbackQuery.data;
@@ -589,31 +875,48 @@ async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env)
         textToCommit = draft.original;
     }
 
-    // Prepare GitHub Commit parameters using Utilities
     const now = new Date();
-    const paths = getRepoPaths(now, "Journal"); // Temporary call to get fileDate
+    const paths = getRepoPaths(now, "Journal");
 
-    // Increment daily count and generate definitive paths
     const nextCount = await incrementAndGetDailyCount(env.JOURNAL_KV, paths.fileDate);
     const finalPaths = getRepoPaths(now, "Journal", `${nextCount}-${messageId}`);
+
+    finalPaths.fileName = finalPaths.fileName.replace('.txt', '.md');
+
+    if (draft.fileId) {
+        const fileUrl = await getTelegramFileUrl(env.TELEGRAM_TOKEN, draft.fileId);
+        const base64Image = await downloadTelegramFileAsBase64(fileUrl);
+        const imageFileName = `img-${finalPaths.fileDate}-${messageId}.jpg`;
+        const imagePath = `${finalPaths.weekFolder}/assets`;
+
+        await commitToGitHub(
+            env.GITHUB_TOKEN,
+            imagePath,
+            imageFileName,
+            `Upload asset: ${imageFileName}`,
+            base64Image,
+            true
+        );
+
+        textToCommit += `\n\n![Visual Context](./assets/${imageFileName})`;
+    }
 
     const result = await commitToGitHub(
         env.GITHUB_TOKEN,
         finalPaths.folderName,
         finalPaths.fileName,
         `Journal Entry: ${finalPaths.formattedDate}`,
-        textToCommit
+        textToCommit,
+        false
     );
 
     if (result.success) {
         await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Successfully committed to ${finalPaths.folderName}/${finalPaths.fileName}!`);
-        // Only real journal entries feed the weekly summary — not accepted /quote commits
         if (draft.original !== "/quote") {
             await appendWeeklyEntry(env.JOURNAL_KV, finalPaths.weekFolder, finalPaths.fileDate, textToCommit);
             await updateWeekReadme(env.GITHUB_TOKEN, env.JOURNAL_KV, finalPaths.weekFolder);
         }
     } else {
-        console.error("GitHub commit error:", result.error);
         await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Failed to commit! ${result.error ?? "GitHub responded with an error."}`);
     }
     await env.JOURNAL_KV.delete(draftKey);
@@ -773,7 +1076,8 @@ export default {
         // Route to the appropriate handler
         if (payload.message && payload.message.text) {
             try {
-                await handleIncomingMessage(payload.message.text.trim(), currentChatId, env);
+                // await handleIncomingMessage(payload.message.text.trim(), currentChatId, env);
+                await handleIncomingMessage(payload.message, currentChatId, env);
             } catch (err) {
                 console.error("handleIncomingMessage error:", err);
                 await sendTelegramMessage(env.TELEGRAM_TOKEN, currentChatId, "Something went wrong processing that — try again.");
