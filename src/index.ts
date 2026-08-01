@@ -10,6 +10,7 @@ export interface Env {
     JOURNAL_KV: KVNamespace;
     AI: any;
     ALLOWED_CHAT_IDS: string;
+    TELEGRAM_WEBHOOK_SECRET: string;
 }
 
 /**
@@ -162,24 +163,49 @@ async function answerCallbackQuery(token: string, callbackQueryId: string): Prom
  * @param {string} content - The plain text content to commit (will be Base64 encoded).
  * @returns {Promise<boolean>} True if the commit was successful, false otherwise.
  */
-async function commitToGitHub(token: string, folderName: string, fileName: string, message: string, content: string): Promise<boolean> {
+async function commitToGitHub(token: string, folderName: string, fileName: string, message: string, content: string): Promise<{ success: boolean, error?: string }> {
     const filePath = `${folderName}/${fileName}`;
     const repoUrl = `https://api.github.com/repos/YaserZarifi/daily-dev-journal/contents/${encodeURIComponent(filePath)}`;
 
-    const response = await fetch(repoUrl, {
+    const headers = {
+        "Authorization": `Bearer ${token}`,
+        "User-Agent": "Cloudflare-Worker",
+        "Accept": "application/vnd.github.v3+json"
+    };
+
+    // Check if the file already exists, so we can pass its sha for an update
+    // instead of colliding on a create.
+    let existingSha: string | undefined;
+    const getResponse = await fetch(repoUrl, { method: "GET", headers });
+    if (getResponse.ok) {
+        const existing: any = await getResponse.json();
+        existingSha = existing.sha;
+    } else if (getResponse.status !== 404) {
+        // Something other than "doesn't exist yet" went wrong (auth, rate limit, etc.)
+        const errBody = await getResponse.text();
+        return { success: false, error: `GitHub GET failed (${getResponse.status}): ${errBody}` };
+    }
+
+    const putBody: any = {
+        message: message,
+        content: btoa(unescape(encodeURIComponent(content)))
+    };
+    if (existingSha) {
+        putBody.sha = existingSha;
+    }
+
+    const putResponse = await fetch(repoUrl, {
         method: "PUT",
-        headers: {
-            "Authorization": `Bearer ${token}`,
-            "User-Agent": "Cloudflare-Worker",
-            "Accept": "application/vnd.github.v3+json"
-        },
-        body: JSON.stringify({
-            message: message,
-            content: btoa(unescape(encodeURIComponent(content)))
-        })
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify(putBody)
     });
 
-    return response.ok;
+    if (!putResponse.ok) {
+        const errBody = await putResponse.text();
+        return { success: false, error: `GitHub PUT failed (${putResponse.status}): ${errBody}` };
+    }
+
+    return { success: true };
 }
 
 /**
@@ -386,7 +412,7 @@ async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env)
     const nextCount = await incrementAndGetDailyCount(env.JOURNAL_KV, paths.fileDate);
     const finalPaths = getRepoPaths(now, "Journal", `${nextCount}-${messageId}`);
 
-    const success = await commitToGitHub(
+    const result = await commitToGitHub(
         env.GITHUB_TOKEN,
         finalPaths.folderName,
         finalPaths.fileName,
@@ -394,10 +420,11 @@ async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env)
         textToCommit
     );
 
-    if (success) {
+    if (result.success) {
         await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Successfully committed to ${finalPaths.folderName}/${finalPaths.fileName}!`);
     } else {
-        await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Failed to commit! GitHub responded with an error.`);
+        console.error("GitHub commit error:", result.error);
+        await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Failed to commit! ${result.error ?? "GitHub responded with an error."}`);
     }
     await env.JOURNAL_KV.delete(draftKey);
 }
@@ -417,13 +444,17 @@ async function runDailyQuoteTask(env: Env): Promise<void> {
     const quoteContent = await generateQuoteWithAI(env.AI);
     const paths = getRepoPaths(new Date(), "Daily-Quote");
 
-    await commitToGitHub(
+    const result = await commitToGitHub(
         env.GITHUB_TOKEN,
         paths.folderName,
         paths.fileName,
         `Daily Quote: ${paths.formattedDate}`,
         quoteContent
     );
+
+    if (!result.success) {
+        console.error("Daily quote commit failed:", result.error);
+    }
 }
 
 /**
@@ -462,6 +493,12 @@ export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
         if (request.method !== "POST") {
             return new Response("Webhook is active");
+        }
+
+        // Reject any request that doesn't carry Telegram's secret token header
+        const incomingSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
+        if (incomingSecret !== env.TELEGRAM_WEBHOOK_SECRET) {
+            return new Response("Unauthorized", { status: 401 });
         }
 
         let payload: any;
