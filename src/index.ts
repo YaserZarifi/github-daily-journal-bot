@@ -558,6 +558,12 @@ The first character of your response must be '#'.`
         ]
     });
 
+    if (!response?.response || typeof response.response !== "string") {
+        // Guards against a transient Workers AI failure (rate limit, model error) or an
+        // unexpected response shape silently propagating `undefined` into the commit.
+        throw new Error(`refineTextWithAI got an unexpected AI response: ${JSON.stringify(response)}`);
+    }
+
     return response.response;
 }
 
@@ -625,13 +631,28 @@ Keep it concise (roughly 150-250 words). Return ONLY the summary, no headers, no
 
 async function getTelegramFileUrl(token: string, fileId: string): Promise<string> {
     const response = await fetch(`https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`);
+    if (!response.ok) {
+        const errBody = await response.text();
+        throw new Error(`Telegram getFile failed (${response.status}): ${errBody}`);
+    }
     const data: any = await response.json();
+    if (!data?.result?.file_path) {
+        // Common causes: file_id expired, or the file exceeds the 20MB Bot API download limit.
+        throw new Error(`Telegram getFile returned no file_path (fileId=${fileId}): ${JSON.stringify(data)}`);
+    }
     return `https://api.telegram.org/file/bot${token}/${data.result.file_path}`;
 }
 
 async function downloadTelegramFileAsBase64(url: string): Promise<string> {
     const response = await fetch(url);
+    if (!response.ok) {
+        const errBody = await response.text();
+        throw new Error(`Telegram file download failed (${response.status}): ${errBody}`);
+    }
     const buffer = await response.arrayBuffer();
+    if (buffer.byteLength === 0) {
+        throw new Error("Telegram file download returned an empty body.");
+    }
     let binary = '';
     const bytes = new Uint8Array(buffer);
     const chunk = 8192;
@@ -1073,10 +1094,13 @@ export default {
             return new Response("OK");
         }
 
-        // Route to the appropriate handler
-        if (payload.message && payload.message.text) {
+        // Route to the appropriate handler.
+        // IMPORTANT: Telegram never sets `message.text` on a photo message, even when it has
+        // a caption — captions live in `message.caption`, and a bare photo has neither.
+        // Gating on `.text` alone means photo/caption updates matched no branch at all and
+        // fell through to `return new Response("OK")` with no reply and no error (silent bug).
+        if (payload.message && (payload.message.text || payload.message.caption || payload.message.photo)) {
             try {
-                // await handleIncomingMessage(payload.message.text.trim(), currentChatId, env);
                 await handleIncomingMessage(payload.message, currentChatId, env);
             } catch (err) {
                 console.error("handleIncomingMessage error:", err);
@@ -1087,6 +1111,22 @@ export default {
                 await handleCallbackQuery(payload.callback_query, currentChatId, env);
             } catch (err) {
                 console.error("handleCallbackQuery error:", err);
+                // Previously this only logged, leaving the user staring at a message whose
+                // Accept/Reject buttons had already fired with no visible outcome. Now we at
+                // least try to tell them it failed instead of going silent on this path too.
+                try {
+                    const failedMessageId = payload.callback_query?.message?.message_id;
+                    if (failedMessageId) {
+                        await editTelegramMessage(
+                            env.TELEGRAM_TOKEN,
+                            currentChatId,
+                            failedMessageId,
+                            `Failed to process that action: ${err instanceof Error ? err.message : "unknown error"}. The draft may still be saved — try the button again.`
+                        );
+                    }
+                } catch (notifyErr) {
+                    console.error("Failed to notify user of callback_query error:", notifyErr);
+                }
             }
         }
 
