@@ -18,6 +18,22 @@ export interface Env {
  * ==========================================
  */
 
+
+
+/**
+ * Computes the ISO 8601 week number and week-year for a given calendar date.
+ * Handles year-boundary weeks correctly (e.g. late-Dec dates can belong to week 1 of next year).
+ */
+function getISOWeek(year: number, month: number, day: number): { isoYear: number, weekNo: number } {
+    const date = new Date(Date.UTC(year, month - 1, day));
+    const dayNum = date.getUTCDay() || 7; // Mon=1 ... Sun=7
+    date.setUTCDate(date.getUTCDate() + 4 - dayNum);
+    const yearStart = new Date(Date.UTC(date.getUTCFullYear(), 0, 1));
+    const weekNo = Math.ceil((((date.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
+    return { isoYear: date.getUTCFullYear(), weekNo };
+}
+
+
 /**
  * Generates standardized folder and file names based on the current date to prevent repetition.
  *
@@ -26,20 +42,28 @@ export interface Env {
  * @param {number|string} [count] - Optional daily count to append to the filename.
  * @returns {Object} Structured paths containing folderName, fileName, formattedDate, and fileDate.
  */
+
 function getRepoPaths(date: Date, prefix: string, count: number | string = ""): { folderName: string, fileName: string, formattedDate: string, fileDate: string } {
     const timeZone = 'Asia/Kabul';
     const dateOptions: Intl.DateTimeFormatOptions = { weekday: 'long', day: 'numeric', month: 'long', timeZone };
     const formattedDate = new Intl.DateTimeFormat('en-GB', dateOptions).format(date);
 
-    // en-CA formats as YYYY-MM-DD, computed in Kabul local time instead of UTC
+    // YYYY-MM-DD in Kabul local time
     const fileDate = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
-    const [yearStr, monthNum] = fileDate.split('-');
+    const [yearStr, monthStr, dayStr] = fileDate.split('-');
+    const year = parseInt(yearStr, 10);
+    const month = parseInt(monthStr, 10);
+    const day = parseInt(dayStr, 10);
 
-    // Generate Folder Name (e.g., "2026-08-August")
-    const monthName = new Intl.DateTimeFormat('en-GB', { month: 'long', timeZone }).format(date);
-    const folderName = `${yearStr}-${monthNum}-${monthName}`;
+    const weekDayName = new Intl.DateTimeFormat('en-GB', { weekday: 'long', timeZone }).format(date);
 
-    // Generate File Name (e.g., "Journal-Monday10August-1.txt")
+    // Week / Day folder structure: e.g. "2026-W31/Saturday-2026-08-01"
+    const { isoYear, weekNo } = getISOWeek(year, month, day);
+    const weekFolder = `${isoYear}-W${weekNo.toString().padStart(2, '0')}`;
+    const dayFolder = `${weekDayName}-${fileDate}`;
+    const folderName = `${weekFolder}/${dayFolder}`;
+
+    // Generate File Name (e.g., "Journal-Saturday1August-8.txt")
     const suffix = count !== "" ? `-${count}` : "";
     const fileName = `${prefix}-${formattedDate.replace(/ /g, '')}${suffix}.txt`;
 
@@ -266,12 +290,20 @@ async function handleIncomingMessage(originalText: string, chatId: string, env: 
         const quoteText = await generateQuoteWithAI(env.AI);
         const messageToSend = `Original:\n/quote\n\nRefined:\n${quoteText}`;
 
-        await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageToSend, {
+        const messageId = await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageToSend, {
             inline_keyboard: [
                 [{ text: "Accept", callback_data: "commit_refined" }],
                 [{ text: "Reject", callback_data: "reject" }]
             ]
         });
+
+        if (messageId) {
+            await env.JOURNAL_KV.put(
+                `draft:${chatId}:${messageId}`,
+                JSON.stringify({ original: "/quote", refined: quoteText }),
+                { expirationTtl: 86400 }
+            );
+        }
         return;
     }
 
