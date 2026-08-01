@@ -1,3 +1,9 @@
+/**
+ * @file index.ts
+ * @description Cloudflare Worker for a Telegram Journal Bot. Handles incoming text,
+ * refines it via AI, and commits the entries to a GitHub repository. Includes scheduled tasks.
+ */
+
 export interface Env {
     TELEGRAM_TOKEN: string;
     GITHUB_TOKEN: string;
@@ -6,289 +12,403 @@ export interface Env {
     ALLOWED_CHAT_IDS: string;
 }
 
-export default {
-    async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-        if (request.method === "POST") {
-            const payload: any = await request.json();
-            const allowedIds = env.ALLOWED_CHAT_IDS.split(",").map(id => id.trim());
-            const botToken = env.TELEGRAM_TOKEN;
-            let currentChatId = null;
+/**
+ * ==========================================
+ * MODULE: UTILITIES
+ * ==========================================
+ */
 
-            if (payload.message && payload.message.chat) {
-                currentChatId = payload.message.chat.id.toString();
-            } else if (payload.callback_query && payload.callback_query.message.chat) {
-                currentChatId = payload.callback_query.message.chat.id.toString();
-            }
+/**
+ * Generates standardized folder and file names based on the current date to prevent repetition.
+ *
+ * @param {Date} date - The current date object.
+ * @param {string} prefix - The prefix for the filename (e.g., 'Journal' or 'Daily-Quote').
+ * @param {number|string} [count] - Optional daily count to append to the filename.
+ * @returns {Object} Structured paths containing folderName, fileName, formattedDate, and fileDate.
+ */
+function getRepoPaths(date: Date, prefix: string, count: number | string = ""): { folderName: string, fileName: string, formattedDate: string, fileDate: string } {
+    const dateOptions: Intl.DateTimeFormatOptions = { weekday: 'long', day: 'numeric', month: 'long' };
+    const formattedDate = new Intl.DateTimeFormat('en-GB', dateOptions).format(date);
+    const fileDate = date.toISOString().split("T")[0];
 
-            if (!currentChatId) {
-                return new Response("OK");
-            }
+    // Generate Folder Name (e.g., "2026-08-August")
+    const monthName = new Intl.DateTimeFormat('en-GB', { month: 'long' }).format(date);
+    const folderName = `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}-${monthName}`;
 
-            if (!allowedIds.includes(currentChatId)) {
-                if (payload.message) {
-                    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            chat_id: currentChatId,
-                            text: "You are not authorized to use this bot."
-                        })
-                    });
-                }
-                return new Response("OK");
-            }
+    // Generate File Name (e.g., "Journal-Monday10August-1.txt")
+    const suffix = count !== "" ? `-${count}` : "";
+    const fileName = `${prefix}-${formattedDate.replace(/ /g, '')}${suffix}.txt`;
 
-            if (payload.message && payload.message.text) {
-                const originalText = payload.message.text;
+    return { folderName, fileName, formattedDate, fileDate };
+}
 
-                if (originalText.trim() === "/stats") {
-                    const fileDate = new Date().toISOString().split("T")[0];
-                    const count = (await env.JOURNAL_KV.get(fileDate)) || "0";
+/**
+ * ==========================================
+ * MODULE: TELEGRAM SERVICES
+ * ==========================================
+ */
 
-                    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            chat_id: currentChatId,
-                            text: `📊 You have committed ${count} journal entries today!`
-                        })
-                    });
-                    return new Response("OK");
-                }
+/**
+ * Sends a message to a specific Telegram chat.
+ *
+ * @param {string} token - Telegram Bot API Token.
+ * @param {string} chatId - The ID of the chat to send the message to.
+ * @param {string} text - The content of the message.
+ * @param {any} [replyMarkup=null] - Optional inline keyboard markup.
+ */
+async function sendTelegramMessage(token: string, chatId: string, text: string, replyMarkup: any = null): Promise<void> {
+    const body: any = { chat_id: chatId, text: text };
+    if (replyMarkup) {
+        body.reply_markup = replyMarkup;
+    }
 
-                if (originalText.trim() === "/quote") {
-                    const aiResponse: any = await env.AI.run("@cf/meta/llama-4-scout-17b-16e-instruct", {
-                        messages: [
-                            { role: "system", content: "You are an assistant. Provide a single, inspiring, profound quote about perseverance, philosophy, or software engineering. Only return the quote and the author. No introductory text." }
-                        ]
-                    });
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+    });
+}
 
-                    const quoteText = aiResponse.response;
-                    const messageToSend = `Original:\n/quote\n\nRefined:\n${quoteText}`;
+/**
+ * Edits an existing message in a Telegram chat (usually used after inline button clicks).
+ *
+ * @param {string} token - Telegram Bot API Token.
+ * @param {string} chatId - The ID of the chat.
+ * @param {string} messageId - The ID of the message to edit.
+ * @param {string} text - The new text for the message.
+ */
+async function editTelegramMessage(token: string, chatId: string, messageId: string, text: string): Promise<void> {
+    await fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            chat_id: chatId,
+            message_id: messageId,
+            text: text
+        })
+    });
+}
 
-                    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            chat_id: currentChatId,
-                            text: messageToSend,
-                            reply_markup: {
-                                inline_keyboard: [
-                                    [
-                                        { text: "Accept", callback_data: "commit_refined" },
-                                    ],
-                                    [
-                                        { text: "Reject", callback_data: "reject" }
-                                    ]
-                                ]
-                            }
-                        })
-                    });
-                    return new Response("OK");
-                }
+/**
+ * ==========================================
+ * MODULE: GITHUB SERVICES
+ * ==========================================
+ */
 
-                const aiResponse: any = await env.AI.run("@cf/meta/llama-4-scout-17b-16e-instruct", {
-                    messages: [
-                        {
-                            role: "system",
-                            content: `You are an expert English editor and writer.
+/**
+ * Commits text content as a file to a specified GitHub repository.
+ *
+ * @param {string} token - GitHub Personal Access Token.
+ * @param {string} folderName - The destination folder path in the repo.
+ * @param {string} fileName - The destination filename.
+ * @param {string} message - The commit message.
+ * @param {string} content - The plain text content to commit (will be Base64 encoded).
+ * @returns {Promise<boolean>} True if the commit was successful, false otherwise.
+ */
+async function commitToGitHub(token: string, folderName: string, fileName: string, message: string, content: string): Promise<boolean> {
+    const filePath = `${folderName}/${fileName}`;
+    const repoUrl = `https://api.github.com/repos/YaserZarifi/daily-dev-journal/contents/${encodeURIComponent(filePath)}`;
 
-Your task is to improve the user's text while preserving its original meaning, intent, and tone.
+    const response = await fetch(repoUrl, {
+        method: "PUT",
+        headers: {
+            "Authorization": `Bearer ${token}`,
+            "User-Agent": "Cloudflare-Worker",
+            "Accept": "application/vnd.github.v3+json"
+        },
+        body: JSON.stringify({
+            message: message,
+            content: btoa(unescape(encodeURIComponent(content)))
+        })
+    });
 
+    return response.ok;
+}
+
+/**
+ * ==========================================
+ * MODULE: STORAGE SERVICES (KV)
+ * ==========================================
+ */
+
+/**
+ * Retrieves the number of journal entries made on a specific date.
+ *
+ * @param {KVNamespace} kv - The Cloudflare KV namespace binding.
+ * @param {string} dateStr - The date string key (YYYY-MM-DD).
+ * @returns {Promise<string>} The count as a string.
+ */
+async function getDailyCount(kv: KVNamespace, dateStr: string): Promise<string> {
+    return (await kv.get(dateStr)) || "0";
+}
+
+/**
+ * Increments the daily journal entry count and returns the new value.
+ *
+ * @param {KVNamespace} kv - The Cloudflare KV namespace binding.
+ * @param {string} dateStr - The date string key (YYYY-MM-DD).
+ * @returns {Promise<number>} The newly incremented count.
+ */
+async function incrementAndGetDailyCount(kv: KVNamespace, dateStr: string): Promise<number> {
+    const currentCount = await getDailyCount(kv, dateStr);
+    const nextCount = parseInt(currentCount) + 1;
+    await kv.put(dateStr, nextCount.toString());
+    return nextCount;
+}
+
+/**
+ * ==========================================
+ * MODULE: AI SERVICES
+ * ==========================================
+ */
+
+/**
+ * Uses Cloudflare AI to refine, spell-check, and improve grammar of the provided text.
+ *
+ * @param {any} ai - The Cloudflare AI binding.
+ * @param {string} text - The raw journal entry text.
+ * @returns {Promise<string>} The refined text.
+ */
+async function refineTextWithAI(ai: any, text: string): Promise<string> {
+    const response: any = await ai.run("@cf/meta/llama-4-scout-17b-16e-instruct", {
+        messages: [
+            {
+                role: "system",
+                content: `You are an expert English editor and writer. Your task is to improve the user's text while preserving its original meaning, intent, and tone.
 Instructions:
 - Correct all grammar, spelling, punctuation, and wording errors.
 - Rewrite awkward or unnatural sentences to sound fluent and natural.
-- Enrich the writing with better vocabulary and smoother sentence flow where appropriate.
-- Improve clarity, readability, and coherence.
-- Keep the text concise unless expansion genuinely improves quality.
 - Preserve the user's voice instead of replacing it with a generic writing style.
-- Make the writing sound as if it were written by a proficient native English speaker.
-- Humanize the text. Avoid stereotypical AI writing patterns.
-- NEVER use em dashes (—) or en dashes (–). Use commas or separate sentences instead.
-- Avoid repetitive sentence structures.
-- Avoid cliché AI phrases, excessive transitions, and predictable compare-and-contrast constructions (such as "not only... but also", "it's not X, it's Y", "whether... or...", "more than just...", "rather than...").
-- Vary sentence lengths naturally.
-- Do not exaggerate or invent information that was not present in the original text.
 - Return ONLY the improved text with no explanations, quotation marks, or conversational filler.`
-                        },
-                        {
-                            role: "user",
-                            content: originalText
-                        }
-                    ]
-                });
+            },
+            { role: "user", content: text }
+        ]
+    });
+    return response.response;
+}
 
-                const refinedText = aiResponse.response;
-                const messageToSend = `Original:\n${originalText}\n\nRefined:\n${refinedText}`;
+/**
+ * Generates an inspiring quote on a randomized topic using AI.
+ *
+ * @param {any} ai - The Cloudflare AI binding.
+ * @returns {Promise<string>} The generated quote.
+ */
+async function generateQuoteWithAI(ai: any): Promise<string> {
+    const topics = ["perseverance", "philosophy", "software engineering", "resilience", "stoicism", "innovation", "creativity", "hard work"];
+    const randomTopic = topics[Math.floor(Math.random() * topics.length)];
+    const randomSeed = Math.floor(Math.random() * 10000);
 
-                await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        chat_id: currentChatId,
-                        text: messageToSend,
-                        reply_markup: {
-                            inline_keyboard: [
-                                [
-                                    { text: "Accept", callback_data: "commit_refined" },
-                                    { text: "Commit Original", callback_data: "commit_original" }
-                                ],
-                                [
-                                    { text: "Reject", callback_data: "reject" }
-                                ]
-                            ]
-                        }
-                    })
-                });
+    const response: any = await ai.run("@cf/meta/llama-4-scout-17b-16e-instruct", {
+        messages: [
+            { role: "system", content: `You are an assistant. Provide a single, inspiring, profound quote about ${randomTopic}. Only return the quote and the author. No introductory text. (Seed: ${randomSeed})` }
+        ]
+    });
+    return response.response;
+}
+
+/**
+ * ==========================================
+ * MODULE: WEBHOOK HANDLERS
+ * ==========================================
+ */
+
+/**
+ * Handles incoming text messages and commands from Telegram.
+ *
+ * @param {string} originalText - The raw text sent by the user.
+ * @param {string} chatId - The ID of the Telegram chat.
+ * @param {Env} env - Environment variables.
+ */
+async function handleIncomingMessage(originalText: string, chatId: string, env: Env): Promise<void> {
+    // Handle /stats command
+    if (originalText === "/stats") {
+        const paths = getRepoPaths(new Date(), "");
+        const count = await getDailyCount(env.JOURNAL_KV, paths.fileDate);
+        await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, `📊 You have committed ${count} journal entries today!`);
+        return;
+    }
+
+    // Handle /quote command
+    if (originalText === "/quote") {
+        const quoteText = await generateQuoteWithAI(env.AI);
+        const messageToSend = `Original:\n/quote\n\nRefined:\n${quoteText}`;
+
+        await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageToSend, {
+            inline_keyboard: [
+                [{ text: "Accept", callback_data: "commit_refined" }],
+                [{ text: "Reject", callback_data: "reject" }]
+            ]
+        });
+        return;
+    }
+
+    // Handle Standard Journal Entry
+    const refinedText = await refineTextWithAI(env.AI, originalText);
+    const messageToSend = `Original:\n${originalText}\n\nRefined:\n${refinedText}`;
+
+    await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageToSend, {
+        inline_keyboard: [
+            [
+                { text: "Accept", callback_data: "commit_refined" },
+                { text: "Commit Original", callback_data: "commit_original" }
+            ],
+            [{ text: "Reject", callback_data: "reject" }]
+        ]
+    });
+}
+
+/**
+ * Handles inline keyboard button clicks (callback queries).
+ *
+ * @param {any} callbackQuery - The callback query payload from Telegram.
+ * @param {string} chatId - The ID of the Telegram chat.
+ * @param {Env} env - Environment variables.
+ */
+async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env): Promise<void> {
+    const messageId = callbackQuery.message.message_id;
+    const data = callbackQuery.data;
+    const textContent = callbackQuery.message.text;
+
+    if (data === "reject") {
+        await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, "Entry rejected and discarded.");
+        return;
+    }
+
+    let textToCommit = "";
+    const parts = textContent.split("Refined:\n");
+
+    if (data === "commit_refined") {
+        textToCommit = parts[1];
+    } else if (data === "commit_original") {
+        textToCommit = parts[0].replace("Original:\n", "").trim();
+    }
+
+    // Prepare GitHub Commit parameters using Utilities
+    const now = new Date();
+    const paths = getRepoPaths(now, "Journal"); // Temporary call to get fileDate
+
+    // Increment daily count and generate definitive paths
+    const nextCount = await incrementAndGetDailyCount(env.JOURNAL_KV, paths.fileDate);
+    const finalPaths = getRepoPaths(now, "Journal", nextCount);
+
+    const success = await commitToGitHub(
+        env.GITHUB_TOKEN,
+        finalPaths.folderName,
+        finalPaths.fileName,
+        `Journal Entry: ${finalPaths.formattedDate}`,
+        textToCommit
+    );
+
+    if (success) {
+        await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Successfully committed to ${finalPaths.folderName}/${finalPaths.fileName}!`);
+    } else {
+        await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Failed to commit! GitHub responded with an error.`);
+    }
+}
+
+/**
+ * ==========================================
+ * MODULE: CRON JOB HANDLERS
+ * ==========================================
+ */
+
+/**
+ * Executes the daily quote generation and commits it directly to GitHub.
+ *
+ * @param {Env} env - Environment variables.
+ */
+async function runDailyQuoteTask(env: Env): Promise<void> {
+    const quoteContent = await generateQuoteWithAI(env.AI);
+    const paths = getRepoPaths(new Date(), "Daily-Quote");
+
+    await commitToGitHub(
+        env.GITHUB_TOKEN,
+        paths.folderName,
+        paths.fileName,
+        `Daily Quote: ${paths.formattedDate}`,
+        quoteContent
+    );
+}
+
+/**
+ * Periodically prompts authorized users on Telegram with random journal nudges.
+ *
+ * @param {Env} env - Environment variables.
+ */
+async function runRandomPromptTask(env: Env): Promise<void> {
+    const probability = Math.random();
+    if (probability > 0.35) return; // 35% chance to trigger
+
+    const allowedIds = env.ALLOWED_CHAT_IDS.split(",").map(id => id.trim());
+    const prompts = [
+        "Time for a quick journal update! What is on your mind?",
+        "Keep the GitHub streak alive! What are you working on right now?",
+        "Checking in! Drop a quick update for the journal.",
+        "Any new ideas or code you want to document?",
+        "How is the progress going today? Send a quick journal entry!"
+    ];
+    const randomPrompt = prompts[Math.floor(Math.random() * prompts.length)];
+
+    for (const targetChatId of allowedIds) {
+        await sendTelegramMessage(env.TELEGRAM_TOKEN, targetChatId, randomPrompt);
+    }
+}
+
+/**
+ * ==========================================
+ * MAIN WORKER EXPORT
+ * ==========================================
+ */
+export default {
+    /**
+     * Entry point for standard HTTP webhooks (Telegram messages & callbacks).
+     */
+    async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+        if (request.method !== "POST") {
+            return new Response("Webhook is active");
+        }
+
+        const payload: any = await request.json();
+        const allowedIds = env.ALLOWED_CHAT_IDS.split(",").map(id => id.trim());
+        let currentChatId = null;
+
+        // Determine chat ID from either message or callback query
+        if (payload.message && payload.message.chat) {
+            currentChatId = payload.message.chat.id.toString();
+        } else if (payload.callback_query && payload.callback_query.message.chat) {
+            currentChatId = payload.callback_query.message.chat.id.toString();
+        }
+
+        if (!currentChatId) return new Response("OK");
+
+        // Validate Authorization
+        if (!allowedIds.includes(currentChatId)) {
+            if (payload.message) {
+                await sendTelegramMessage(env.TELEGRAM_TOKEN, currentChatId, "You are not authorized to use this bot.");
             }
-
-            if (payload.callback_query) {
-                const messageId = payload.callback_query.message.message_id;
-                const data = payload.callback_query.data;
-                const textContent = payload.callback_query.message.text;
-
-                if (data === "reject") {
-                    await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            chat_id: currentChatId,
-                            message_id: messageId,
-                            text: "Entry rejected and discarded."
-                        })
-                    });
-                    return new Response("OK");
-                }
-
-                let textToCommit = "";
-                const parts = textContent.split("Refined:\n");
-
-                if (data === "commit_refined") {
-                    textToCommit = parts[1];
-                } else if (data === "commit_original") {
-                    textToCommit = parts[0].replace("Original:\n", "").trim();
-                }
-
-                const dateOptions: Intl.DateTimeFormatOptions = { weekday: 'long', day: 'numeric', month: 'long' };
-                const formattedDate = new Intl.DateTimeFormat('en-GB', dateOptions).format(new Date());
-                const fileDate = new Date().toISOString().split("T")[0];
-
-                const count = (await env.JOURNAL_KV.get(fileDate)) || "0";
-                const nextCount = parseInt(count) + 1;
-                await env.JOURNAL_KV.put(fileDate, nextCount.toString());
-
-                // FIX 1: Removed the '#' to prevent URL fragment truncation
-                const fileName = `Journal-${formattedDate.replace(/ /g, '')}-${nextCount}.txt`;
-                const githubToken = env.GITHUB_TOKEN;
-
-                // FIX 2: Added encodeURIComponent to safely handle any weird characters in the filename
-                const repoUrl = `https://api.github.com/repos/YaserZarifi/daily-dev-journal/contents/${encodeURIComponent(fileName)}`;
-
-                // FIX 3: Capture the GitHub response
-                const githubResponse = await fetch(repoUrl, {
-                    method: "PUT",
-                    headers: {
-                        "Authorization": `Bearer ${githubToken}`,
-                        "User-Agent": "Cloudflare-Worker",
-                        "Accept": "application/vnd.github.v3+json"
-                    },
-                    body: JSON.stringify({
-                        message: `Journal Entry: ${formattedDate}`,
-                        content: btoa(unescape(encodeURIComponent(textToCommit)))
-                    })
-                });
-
-                // FIX 4: Only say success if GitHub actually returns an OK status (200 or 201)
-                if (githubResponse.ok) {
-                    await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            chat_id: currentChatId,
-                            message_id: messageId,
-                            text: `Successfully committed ${fileName} to GitHub!`
-                        })
-                    });
-                } else {
-                    const errorData = await githubResponse.text();
-                    await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            chat_id: currentChatId,
-                            message_id: messageId,
-                            text: `Failed to commit! GitHub responded with an error.`
-                        })
-                    });
-                }
-            }
-
-            // This return successfully closes the POST request block!
             return new Response("OK");
         }
 
-        return new Response("Webhook is active");
+        // Route to the appropriate handler
+        if (payload.message && payload.message.text) {
+            await handleIncomingMessage(payload.message.text.trim(), currentChatId, env);
+        } else if (payload.callback_query) {
+            await handleCallbackQuery(payload.callback_query, currentChatId, env);
+        }
+
+        return new Response("OK");
     },
 
+    /**
+     * Entry point for scheduled Cron Triggers.
+     */
     async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-        const is11PMTrigger = event.cron === "30 18 * * *";
+        const is11PMTrigger = event.cron === "30 18 * * *"; // 6:30 PM UTC = 11:00 PM Kabul
 
         if (is11PMTrigger) {
-            const aiResponse: any = await env.AI.run("@cf/meta/llama-4-scout-17b-16e-instruct", {
-                messages: [
-                    { role: "system", content: "You are an assistant. Provide a single, inspiring, profound quote about perseverance, philosophy, or software engineering. Only return the quote and the author. No introductory text." }
-                ]
-            });
-
-            const quoteContent = aiResponse.response;
-            const dateOptions: Intl.DateTimeFormatOptions = { weekday: 'long', day: 'numeric', month: 'long' };
-            const formattedDate = new Intl.DateTimeFormat('en-GB', dateOptions).format(new Date());
-
-            const fileName = `Daily-Quote-${formattedDate.replace(/ /g, '')}.txt`;
-            const githubToken = env.GITHUB_TOKEN;
-            const repoUrl = `https://api.github.com/repos/YaserZarifi/daily-dev-journal/contents/${fileName}`;
-
-            await fetch(repoUrl, {
-                method: "PUT",
-                headers: {
-                    "Authorization": `Bearer ${githubToken}`,
-                    "User-Agent": "Cloudflare-Worker",
-                    "Accept": "application/vnd.github.v3+json"
-                },
-                body: JSON.stringify({
-                    message: `Daily Quote: ${formattedDate}`,
-                    content: btoa(unescape(encodeURIComponent(quoteContent)))
-                })
-            });
-
+            await runDailyQuoteTask(env);
         } else {
-            const probability = Math.random();
-
-            if (probability <= 0.35) {
-                const botToken = env.TELEGRAM_TOKEN;
-                const allowedIds = env.ALLOWED_CHAT_IDS.split(",").map(id => id.trim());
-
-                const prompts = [
-                    "Time for a quick journal update! What is on your mind?",
-                    "Keep the GitHub streak alive! What are you working on right now?",
-                    "Checking in! Drop a quick update for the journal.",
-                    "Any new ideas or code you want to document?",
-                    "How is the progress going today? Send a quick journal entry!"
-                ];
-
-                const randomPrompt = prompts[Math.floor(Math.random() * prompts.length)];
-
-                for (const targetChatId of allowedIds) {
-                    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            chat_id: targetChatId,
-                            text: randomPrompt
-                        })
-                    });
-                }
-            }
+            await runRandomPromptTask(env);
         }
     }
 };
