@@ -27,13 +27,17 @@ export interface Env {
  * @returns {Object} Structured paths containing folderName, fileName, formattedDate, and fileDate.
  */
 function getRepoPaths(date: Date, prefix: string, count: number | string = ""): { folderName: string, fileName: string, formattedDate: string, fileDate: string } {
-    const dateOptions: Intl.DateTimeFormatOptions = { weekday: 'long', day: 'numeric', month: 'long' };
+    const timeZone = 'Asia/Kabul';
+    const dateOptions: Intl.DateTimeFormatOptions = { weekday: 'long', day: 'numeric', month: 'long', timeZone };
     const formattedDate = new Intl.DateTimeFormat('en-GB', dateOptions).format(date);
-    const fileDate = date.toISOString().split("T")[0];
+
+    // en-CA formats as YYYY-MM-DD, computed in Kabul local time instead of UTC
+    const fileDate = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
+    const [yearStr, monthNum] = fileDate.split('-');
 
     // Generate Folder Name (e.g., "2026-08-August")
-    const monthName = new Intl.DateTimeFormat('en-GB', { month: 'long' }).format(date);
-    const folderName = `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}-${monthName}`;
+    const monthName = new Intl.DateTimeFormat('en-GB', { month: 'long', timeZone }).format(date);
+    const folderName = `${yearStr}-${monthNum}-${monthName}`;
 
     // Generate File Name (e.g., "Journal-Monday10August-1.txt")
     const suffix = count !== "" ? `-${count}` : "";
@@ -56,17 +60,38 @@ function getRepoPaths(date: Date, prefix: string, count: number | string = ""): 
  * @param {string} text - The content of the message.
  * @param {any} [replyMarkup=null] - Optional inline keyboard markup.
  */
-async function sendTelegramMessage(token: string, chatId: string, text: string, replyMarkup: any = null): Promise<void> {
+// async function sendTelegramMessage(token: string, chatId: string, text: string, replyMarkup: any = null): Promise<void> {
+//     const body: any = { chat_id: chatId, text: text };
+//     if (replyMarkup) {
+//         body.reply_markup = replyMarkup;
+//     }
+
+//     await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+//         method: "POST",
+//         headers: { "Content-Type": "application/json" },
+//         body: JSON.stringify(body)
+//     });
+// }
+
+async function sendTelegramMessage(token: string, chatId: string, text: string, replyMarkup: any = null): Promise<number | null> {
     const body: any = { chat_id: chatId, text: text };
     if (replyMarkup) {
         body.reply_markup = replyMarkup;
     }
 
-    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body)
     });
+
+    if (!response.ok) {
+        console.error("sendMessage failed:", await response.text());
+        return null;
+    }
+
+    const result: any = await response.json();
+    return result.result?.message_id ?? null;
 }
 
 /**
@@ -86,6 +111,14 @@ async function editTelegramMessage(token: string, chatId: string, messageId: str
             message_id: messageId,
             text: text
         })
+    });
+}
+
+async function answerCallbackQuery(token: string, callbackQueryId: string): Promise<void> {
+    await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ callback_query_id: callbackQueryId })
     });
 }
 
@@ -243,10 +276,24 @@ async function handleIncomingMessage(originalText: string, chatId: string, env: 
     }
 
     // Handle Standard Journal Entry
+//     const refinedText = await refineTextWithAI(env.AI, originalText);
+//     const messageToSend = `Original:\n${originalText}\n\nRefined:\n${refinedText}`;
+
+//     await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageToSend, {
+//         inline_keyboard: [
+//             [
+//                 { text: "Accept", callback_data: "commit_refined" },
+//                 { text: "Commit Original", callback_data: "commit_original" }
+//             ],
+//             [{ text: "Reject", callback_data: "reject" }]
+//         ]
+//     });
+// }
+// Handle Standard Journal Entry
     const refinedText = await refineTextWithAI(env.AI, originalText);
     const messageToSend = `Original:\n${originalText}\n\nRefined:\n${refinedText}`;
 
-    await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageToSend, {
+    const messageId = await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageToSend, {
         inline_keyboard: [
             [
                 { text: "Accept", callback_data: "commit_refined" },
@@ -255,6 +302,14 @@ async function handleIncomingMessage(originalText: string, chatId: string, env: 
             [{ text: "Reject", callback_data: "reject" }]
         ]
     });
+
+    if (messageId) {
+        await env.JOURNAL_KV.put(
+            `draft:${chatId}:${messageId}`,
+            JSON.stringify({ original: originalText, refined: refinedText }),
+            { expirationTtl: 86400 }
+        );
+    }
 }
 
 /**
@@ -267,20 +322,28 @@ async function handleIncomingMessage(originalText: string, chatId: string, env: 
 async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env): Promise<void> {
     const messageId = callbackQuery.message.message_id;
     const data = callbackQuery.data;
-    const textContent = callbackQuery.message.text;
+    const draftKey = `draft:${chatId}:${messageId}`;
+
+    await answerCallbackQuery(env.TELEGRAM_TOKEN, callbackQuery.id);
 
     if (data === "reject") {
         await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, "Entry rejected and discarded.");
+        await env.JOURNAL_KV.delete(draftKey);
         return;
     }
 
-    let textToCommit = "";
-    const parts = textContent.split("Refined:\n");
+    const draftRaw = await env.JOURNAL_KV.get(draftKey);
+    if (!draftRaw) {
+        await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, "This entry expired or was already processed.");
+        return;
+    }
+    const draft = JSON.parse(draftRaw);
 
+    let textToCommit = "";
     if (data === "commit_refined") {
-        textToCommit = parts[1];
+        textToCommit = draft.refined;
     } else if (data === "commit_original") {
-        textToCommit = parts[0].replace("Original:\n", "").trim();
+        textToCommit = draft.original;
     }
 
     // Prepare GitHub Commit parameters using Utilities
@@ -289,7 +352,7 @@ async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env)
 
     // Increment daily count and generate definitive paths
     const nextCount = await incrementAndGetDailyCount(env.JOURNAL_KV, paths.fileDate);
-    const finalPaths = getRepoPaths(now, "Journal", nextCount);
+    const finalPaths = getRepoPaths(now, "Journal", `${nextCount}-${messageId}`);
 
     const success = await commitToGitHub(
         env.GITHUB_TOKEN,
@@ -304,6 +367,7 @@ async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env)
     } else {
         await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Failed to commit! GitHub responded with an error.`);
     }
+    await env.JOURNAL_KV.delete(draftKey);
 }
 
 /**
@@ -368,7 +432,13 @@ export default {
             return new Response("Webhook is active");
         }
 
-        const payload: any = await request.json();
+        let payload: any;
+        try {
+            payload = await request.json();
+        } catch (err) {
+            console.error("Invalid JSON payload:", err);
+            return new Response("OK"); // ack anyway so Telegram doesn't retry
+        }
         const allowedIds = env.ALLOWED_CHAT_IDS.split(",").map(id => id.trim());
         let currentChatId = null;
 
@@ -391,9 +461,18 @@ export default {
 
         // Route to the appropriate handler
         if (payload.message && payload.message.text) {
-            await handleIncomingMessage(payload.message.text.trim(), currentChatId, env);
+            try {
+                await handleIncomingMessage(payload.message.text.trim(), currentChatId, env);
+            } catch (err) {
+                console.error("handleIncomingMessage error:", err);
+                await sendTelegramMessage(env.TELEGRAM_TOKEN, currentChatId, "Something went wrong processing that — try again.");
+            }
         } else if (payload.callback_query) {
-            await handleCallbackQuery(payload.callback_query, currentChatId, env);
+            try {
+                await handleCallbackQuery(payload.callback_query, currentChatId, env);
+            } catch (err) {
+                console.error("handleCallbackQuery error:", err);
+            }
         }
 
         return new Response("OK");
