@@ -24,9 +24,7 @@
         "binding": "AI"
     },
     "triggers": {
-        "crons": [
-            "0 * * * *"
-        ]
+        "crons": ["0 * * * *", "30 18 * * *"]
     }
     /**
 	 * Smart Placement
