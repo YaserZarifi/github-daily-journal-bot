@@ -727,7 +727,7 @@ export default {
      */
     async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
         const is11PMTrigger = event.cron === "30 18 * * *"; // 6:30 PM UTC daily = 11:00 PM Kabul
-        const isWeeklySummaryTrigger = event.cron === "30 18 * * 0"; // Sunday only, same local time
+        const isWeeklySummaryTrigger = event.cron === "30 18 * * 7"; // Sunday only (Cloudflare uses 7 for Sunday, not 0), same local time
 
         if (isWeeklySummaryTrigger) {
             await runWeeklySummaryTask(env);
