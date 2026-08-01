@@ -486,21 +486,16 @@ async function handleIncomingMessage(originalText: string, chatId: string, env: 
         return;
     }
 
-    // Handle Standard Journal Entry
-//     const refinedText = await refineTextWithAI(env.AI, originalText);
-//     const messageToSend = `Original:\n${originalText}\n\nRefined:\n${refinedText}`;
+    // Handle /streak command
+    if (originalText === "/streak") {
+        const streak = await calculateStreak(env.JOURNAL_KV, new Date());
+        const emoji = streak > 0 ? "🔥" : "💤";
+        const dayWord = streak === 1 ? "day" : "days";
+        await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, `${emoji} Current streak: ${streak} ${dayWord}`);
+        return;
+    }
 
-//     await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageToSend, {
-//         inline_keyboard: [
-//             [
-//                 { text: "Accept", callback_data: "commit_refined" },
-//                 { text: "Commit Original", callback_data: "commit_original" }
-//             ],
-//             [{ text: "Reject", callback_data: "reject" }]
-//         ]
-//     });
-// }
-// Handle Standard Journal Entry
+    // Handle Standard Journal Entry
     const refinedText = await refineTextWithAI(env.AI, originalText);
     const messageToSend = `Original:\n${originalText}\n\nRefined:\n${refinedText}`;
 
