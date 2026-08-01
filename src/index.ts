@@ -11,6 +11,10 @@ export interface Env {
     AI: any;
     ALLOWED_CHAT_IDS: string;
     TELEGRAM_WEBHOOK_SECRET: string;
+    // Optional: your repo's default branch. Only used by the large-file (Git Data API) commit
+    // path below. Falls back to "main" if not set — add this as a Worker secret/var if your
+    // default branch is something else (e.g. "master").
+    GITHUB_BRANCH?: string;
 }
 
 /**
@@ -18,6 +22,27 @@ export interface Env {
  * MODULE: UTILITIES
  * ==========================================
  */
+
+/**
+ * Constant-time string comparison, used for the webhook secret check so response timing
+ * can't be used to guess the secret one character at a time.
+ */
+function timingSafeEqual(a: string, b: string): boolean {
+    if (a.length !== b.length) return false;
+    let mismatch = 0;
+    for (let i = 0; i < a.length; i++) {
+        mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    }
+    return mismatch === 0;
+}
+
+/**
+ * Caps how much upstream error text gets relayed back to Telegram, so a verbose
+ * GitHub/Telegram API error body doesn't turn into a wall of text in chat.
+ */
+function truncateForTelegram(text: string, maxLength: number = 300): string {
+    return text.length > maxLength ? text.slice(0, maxLength) + "…" : text;
+}
 
 
 
@@ -270,8 +295,84 @@ async function answerCallbackQuery(token: string, callbackQueryId: string): Prom
 
 
 
-async function commitToGitHub(token: string, folderName: string, fileName: string, message: string, content: string, isBase64: boolean = false): Promise<{ success: boolean, error?: string }> {
+// GitHub's Contents API (used below) only reliably accepts files up to ~1MB; anything bigger
+// needs the lower-level Git Data API (blob -> tree -> commit -> ref). Telegram-compressed
+// photos are usually well under this, but it's an easy silent-failure trap once someone sends
+// a document-quality image or a big screenshot.
+const GITHUB_CONTENTS_API_SIZE_LIMIT = 1_400_000; // ~1MB raw, accounting for base64 inflation
+
+/**
+ * Commits a file via the Git Data API instead of the Contents API. Required for files over
+ * ~1MB, which the Contents API's single-request PUT can't reliably handle. This performs a
+ * genuine multi-step git operation (read ref -> read tree -> create blob -> create tree ->
+ * create commit -> move ref), so a failure partway through can leave an orphaned blob/tree/commit
+ * object in the repo — harmless (they're just unreferenced), but the branch ref itself is only
+ * ever moved in the last step, so the visible repo state never ends up half-written.
+ */
+async function commitLargeFileToGitHub(token: string, branch: string, filePath: string, message: string, base64Content: string): Promise<{ success: boolean, error?: string }> {
+    const apiBase = "https://api.github.com/repos/YaserZarifi/daily-dev-journal";
+    const headers = {
+        "Authorization": `Bearer ${token}`,
+        "User-Agent": "Cloudflare-Worker",
+        "Accept": "application/vnd.github.v3+json",
+        "Content-Type": "application/json"
+    };
+
+    try {
+        const refResp = await fetch(`${apiBase}/git/refs/heads/${branch}`, { headers });
+        if (!refResp.ok) return { success: false, error: `Failed to read branch ref (${refResp.status}): ${await refResp.text()}` };
+        const refData: any = await refResp.json();
+        const parentCommitSha = refData.object.sha;
+
+        const commitResp = await fetch(`${apiBase}/git/commits/${parentCommitSha}`, { headers });
+        if (!commitResp.ok) return { success: false, error: `Failed to read parent commit (${commitResp.status}): ${await commitResp.text()}` };
+        const commitData: any = await commitResp.json();
+        const baseTreeSha = commitData.tree.sha;
+
+        const blobResp = await fetch(`${apiBase}/git/blobs`, {
+            method: "POST", headers,
+            body: JSON.stringify({ content: base64Content, encoding: "base64" })
+        });
+        if (!blobResp.ok) return { success: false, error: `Failed to create blob (${blobResp.status}): ${await blobResp.text()}` };
+        const blobData: any = await blobResp.json();
+
+        const treeResp = await fetch(`${apiBase}/git/trees`, {
+            method: "POST", headers,
+            body: JSON.stringify({
+                base_tree: baseTreeSha,
+                tree: [{ path: filePath, mode: "100644", type: "blob", sha: blobData.sha }]
+            })
+        });
+        if (!treeResp.ok) return { success: false, error: `Failed to create tree (${treeResp.status}): ${await treeResp.text()}` };
+        const treeData: any = await treeResp.json();
+
+        const newCommitResp = await fetch(`${apiBase}/git/commits`, {
+            method: "POST", headers,
+            body: JSON.stringify({ message, tree: treeData.sha, parents: [parentCommitSha] })
+        });
+        if (!newCommitResp.ok) return { success: false, error: `Failed to create commit (${newCommitResp.status}): ${await newCommitResp.text()}` };
+        const newCommitData: any = await newCommitResp.json();
+
+        const updateRefResp = await fetch(`${apiBase}/git/refs/heads/${branch}`, {
+            method: "PATCH", headers,
+            body: JSON.stringify({ sha: newCommitData.sha })
+        });
+        if (!updateRefResp.ok) return { success: false, error: `Failed to update branch ref (${updateRefResp.status}): ${await updateRefResp.text()}` };
+
+        return { success: true };
+    } catch (err) {
+        return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+}
+
+async function commitToGitHub(token: string, folderName: string, fileName: string, message: string, content: string, isBase64: boolean = false, branch: string = "main"): Promise<{ success: boolean, error?: string }> {
     const filePath = folderName ? `${folderName}/${fileName}` : fileName;
+
+    // Large payloads (mainly photos) can't go through the single-request Contents API below.
+    if (isBase64 && content.length > GITHUB_CONTENTS_API_SIZE_LIMIT) {
+        return commitLargeFileToGitHub(token, branch, filePath, message, content);
+    }
+
     const encodedPath = filePath.split('/').map(segment => encodeURIComponent(segment)).join('/');
     const repoUrl = `https://api.github.com/repos/YaserZarifi/daily-dev-journal/contents/${encodedPath}`;
 
@@ -446,6 +547,23 @@ async function getWeeklyEntries(kv: KVNamespace, weekFolder: string): Promise<{ 
  */
 async function clearWeeklyEntries(kv: KVNamespace, weekFolder: string): Promise<void> {
     await kv.delete(`week-entries:${weekFolder}`);
+}
+
+/**
+ * Tracks the last 10 successfully committed entries (journal or quote), so /recent can
+ * link straight back to them without leaving Telegram to dig through GitHub.
+ */
+async function appendRecentEntry(kv: KVNamespace, entry: { date: string, path: string }): Promise<void> {
+    const key = "recent-entries";
+    const raw = await kv.get(key);
+    const list: { date: string, path: string }[] = raw ? JSON.parse(raw) : [];
+    list.unshift(entry);
+    await kv.put(key, JSON.stringify(list.slice(0, 10)));
+}
+
+async function getRecentEntries(kv: KVNamespace): Promise<{ date: string, path: string }[]> {
+    const raw = await kv.get("recent-entries");
+    return raw ? JSON.parse(raw) : [];
 }
 
 
@@ -777,6 +895,46 @@ async function handleIncomingMessage(payloadMessage: any, chatId: string, env: E
         return;
     }
 
+    if (originalText === "/help") {
+        await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId,
+            "📖 Commands:\n" +
+            "/stats — today's entry count\n" +
+            "/streak — current journaling streak\n" +
+            "/quote — generate a quote to commit\n" +
+            "/recent — links to your last 10 committed entries\n" +
+            "/cancel — discard any pending drafts\n" +
+            "/help — show this message\n\n" +
+            "Or just send text, or a photo with an optional caption, to draft a new journal entry."
+        );
+        return;
+    }
+
+    if (originalText === "/recent") {
+        const entries = await getRecentEntries(env.JOURNAL_KV);
+        if (entries.length === 0) {
+            await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, "No entries committed yet.");
+            return;
+        }
+        const branch = env.GITHUB_BRANCH || "main";
+        const lines = entries.map(e => `• ${e.date}: https://github.com/YaserZarifi/daily-dev-journal/blob/${branch}/${e.path}`);
+        await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, `📚 Last ${entries.length} entries:\n\n${lines.join("\n")}`);
+        return;
+    }
+
+    if (originalText === "/cancel") {
+        const prefix = `draft:${chatId}:`;
+        const list = await env.JOURNAL_KV.list({ prefix });
+        for (const key of list.keys) {
+            await env.JOURNAL_KV.delete(key.name);
+        }
+        await sendTelegramMessage(
+            env.TELEGRAM_TOKEN,
+            chatId,
+            list.keys.length > 0 ? `Cancelled ${list.keys.length} pending draft(s).` : "No pending drafts to cancel."
+        );
+        return;
+    }
+
     let fileId = null;
     if (payloadMessage.photo && payloadMessage.photo.length > 0) {
         fileId = payloadMessage.photo[payloadMessage.photo.length - 1].file_id;
@@ -889,6 +1047,11 @@ async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env)
     }
     const draft = JSON.parse(draftRaw);
 
+    // The full commit flow below can involve several sequential GitHub API calls (plus an
+    // image upload), which can take a few seconds. Give immediate feedback so it doesn't look
+    // like nothing happened after tapping the button.
+    await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, "⏳ Committing your entry...");
+
     let textToCommit = "";
     if (data === "commit_refined") {
         textToCommit = draft.refined;
@@ -916,7 +1079,8 @@ async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env)
             imageFileName,
             `Upload asset: ${imageFileName}`,
             base64Image,
-            true
+            true,
+            env.GITHUB_BRANCH || "main"
         );
 
         // Images live under the WEEK folder (`${weekFolder}/assets/...`), but this markdown
@@ -937,12 +1101,13 @@ async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env)
 
     if (result.success) {
         await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Successfully committed to ${finalPaths.folderName}/${finalPaths.fileName}!`);
+        await appendRecentEntry(env.JOURNAL_KV, { date: finalPaths.fileDate, path: `${finalPaths.folderName}/${finalPaths.fileName}` });
         if (draft.original !== "/quote") {
             await appendWeeklyEntry(env.JOURNAL_KV, finalPaths.weekFolder, finalPaths.fileDate, textToCommit);
             await updateWeekReadme(env.GITHUB_TOKEN, env.JOURNAL_KV, finalPaths.weekFolder);
         }
     } else {
-        await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Failed to commit! ${result.error ?? "GitHub responded with an error."}`);
+        await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Failed to commit! ${truncateForTelegram(result.error ?? "GitHub responded with an error.")}`);
     }
     await env.JOURNAL_KV.delete(draftKey);
 }
@@ -954,24 +1119,48 @@ async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env)
  */
 
 /**
+ * Best-effort notification to every allowed chat — used by cron tasks, which have no
+ * single "requester" to reply to. Failures here are only logged, never thrown, so a
+ * Telegram hiccup can't mask the original error that triggered the notification.
+ */
+async function notifyAllowedChats(env: Env, text: string): Promise<void> {
+    const allowedIds = env.ALLOWED_CHAT_IDS.split(",").map(id => id.trim()).filter(Boolean);
+    for (const chatId of allowedIds) {
+        try {
+            await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, text);
+        } catch (err) {
+            console.error(`Failed to notify chat ${chatId}:`, err);
+        }
+    }
+}
+
+/**
  * Executes the daily quote generation and commits it directly to GitHub.
  *
  * @param {Env} env - Environment variables.
  */
 async function runDailyQuoteTask(env: Env): Promise<void> {
-    const quoteContent = await generateQuoteWithAI(env.AI);
-    const paths = getRepoPaths(new Date(), "Daily-Quote");
+    try {
+        const quoteContent = await generateQuoteWithAI(env.AI);
+        const paths = getRepoPaths(new Date(), "Daily-Quote");
 
-    const result = await commitToGitHub(
-        env.GITHUB_TOKEN,
-        paths.folderName,
-        paths.fileName,
-        `Daily Quote: ${paths.formattedDate}`,
-        quoteContent
-    );
+        const result = await commitToGitHub(
+            env.GITHUB_TOKEN,
+            paths.folderName,
+            paths.fileName,
+            `Daily Quote: ${paths.formattedDate}`,
+            quoteContent
+        );
 
-    if (!result.success) {
-        console.error("Daily quote commit failed:", result.error);
+        if (!result.success) {
+            console.error("Daily quote commit failed:", result.error);
+            await notifyAllowedChats(env, `⚠️ Daily quote commit failed: ${truncateForTelegram(result.error ?? "unknown error")}`);
+        }
+    } catch (err) {
+        // Previously unguarded — an AI or network failure here would kill the whole
+        // scheduled() invocation with no retry and no record that the day was missed.
+        console.error("runDailyQuoteTask crashed:", err);
+        await notifyAllowedChats(env, `⚠️ Daily quote task crashed: ${truncateForTelegram(err instanceof Error ? err.message : String(err))}`);
     }
 }
 
@@ -984,32 +1173,41 @@ async function runDailyQuoteTask(env: Env): Promise<void> {
  * If the commit fails, entries are left in KV so the next run can retry.
  */
 async function runWeeklySummaryTask(env: Env): Promise<void> {
-    const now = new Date();
-    const weekFolder = getWeekFolder(now);
-    const entries = await getWeeklyEntries(env.JOURNAL_KV, weekFolder);
+    try {
+        const now = new Date();
+        const weekFolder = getWeekFolder(now);
+        const entries = await getWeeklyEntries(env.JOURNAL_KV, weekFolder);
 
-    if (entries.length === 0) {
-        console.log(`No entries to summarize for week ${weekFolder}, skipping.`);
-        return;
+        if (entries.length === 0) {
+            console.log(`No entries to summarize for week ${weekFolder}, skipping.`);
+            return;
+        }
+
+        const summary = await summarizeWeekWithAI(env.AI, entries);
+
+        const result = await commitToGitHub(
+            env.GITHUB_TOKEN,
+            weekFolder,
+            "Weekly-Summary.txt",
+            `Weekly Summary: ${weekFolder}`,
+            summary
+        );
+
+        if (!result.success) {
+            console.error("Weekly summary commit failed:", result.error);
+            await notifyAllowedChats(env, `⚠️ Weekly summary commit failed: ${truncateForTelegram(result.error ?? "unknown error")}`);
+            return; // entries stay in KV so the next run can retry, as before
+        }
+
+        await clearWeeklyEntries(env.JOURNAL_KV, weekFolder);
+        await updateWeekReadme(env.GITHUB_TOKEN, env.JOURNAL_KV, weekFolder); // reflects cleared count, since a new week's tracking starts fresh
+    } catch (err) {
+        // Previously unguarded. Note entries are deliberately NOT cleared here (that only
+        // happens after a confirmed successful commit above), so a crash mid-task still
+        // leaves the week's entries intact for the next scheduled retry.
+        console.error("runWeeklySummaryTask crashed:", err);
+        await notifyAllowedChats(env, `⚠️ Weekly summary task crashed: ${truncateForTelegram(err instanceof Error ? err.message : String(err))}`);
     }
-
-    const summary = await summarizeWeekWithAI(env.AI, entries);
-
-    const result = await commitToGitHub(
-        env.GITHUB_TOKEN,
-        weekFolder,
-        "Weekly-Summary.txt",
-        `Weekly Summary: ${weekFolder}`,
-        summary
-    );
-
-    if (!result.success) {
-        console.error("Weekly summary commit failed:", result.error);
-        return;
-    }
-
-    await clearWeeklyEntries(env.JOURNAL_KV, weekFolder);
-    await updateWeekReadme(env.GITHUB_TOKEN, env.JOURNAL_KV, weekFolder); // reflects cleared count, since a new week's tracking starts fresh
 }
 
 
@@ -1055,7 +1253,7 @@ export default {
 
         // Reject any request that doesn't carry Telegram's secret token header
         const incomingSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
-        if (incomingSecret !== env.TELEGRAM_WEBHOOK_SECRET) {
+        if (!incomingSecret || !timingSafeEqual(incomingSecret, env.TELEGRAM_WEBHOOK_SECRET)) {
             return new Response("Unauthorized", { status: 401 });
         }
 
@@ -1076,6 +1274,19 @@ export default {
             }
             // Short TTL is enough — Telegram retries happen within seconds/minutes, not days
             await env.JOURNAL_KV.put(dedupeKey, "1", { expirationTtl: 300 });
+        }
+
+        // Telegram sends each photo in an album as a separate update sharing a media_group_id,
+        // usually with only the first carrying the caption. Without this guard, a 3-photo album
+        // would spawn three separate drafts with three separate Accept/Reject prompts. We only
+        // process the first update of a group and silently ack the rest.
+        if (payload.message?.media_group_id) {
+            const groupKey = `seen-media-group:${payload.message.media_group_id}`;
+            const alreadySeenGroup = await env.JOURNAL_KV.get(groupKey);
+            if (alreadySeenGroup) {
+                return new Response("OK");
+            }
+            await env.JOURNAL_KV.put(groupKey, "1", { expirationTtl: 300 });
         }
 
         const allowedIds = env.ALLOWED_CHAT_IDS.split(",").map(id => id.trim());
