@@ -919,7 +919,11 @@ async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env)
             true
         );
 
-        textToCommit += `\n\n![Visual Context](./assets/${imageFileName})`;
+        // Images live under the WEEK folder (`${weekFolder}/assets/...`), but this markdown
+        // file lives one level deeper, inside the DAY folder (`${weekFolder}/${dayFolder}/...`).
+        // So the link must go up one level before descending into assets/, otherwise GitHub
+        // resolves it relative to the day folder and 404s.
+        textToCommit += `\n\n![Visual Context](../assets/${imageFileName})`;
     }
 
     const result = await commitToGitHub(
