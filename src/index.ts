@@ -11,10 +11,6 @@ export interface Env {
     AI: any;
     ALLOWED_CHAT_IDS: string;
     TELEGRAM_WEBHOOK_SECRET: string;
-    // Optional: your repo's default branch. Only used by the large-file (Git Data API) commit
-    // path below. Falls back to "main" if not set — add this as a Worker secret/var if your
-    // default branch is something else (e.g. "master").
-    GITHUB_BRANCH?: string;
 }
 
 /**
@@ -295,84 +291,8 @@ async function answerCallbackQuery(token: string, callbackQueryId: string): Prom
 
 
 
-// GitHub's Contents API (used below) only reliably accepts files up to ~1MB; anything bigger
-// needs the lower-level Git Data API (blob -> tree -> commit -> ref). Telegram-compressed
-// photos are usually well under this, but it's an easy silent-failure trap once someone sends
-// a document-quality image or a big screenshot.
-const GITHUB_CONTENTS_API_SIZE_LIMIT = 1_400_000; // ~1MB raw, accounting for base64 inflation
-
-/**
- * Commits a file via the Git Data API instead of the Contents API. Required for files over
- * ~1MB, which the Contents API's single-request PUT can't reliably handle. This performs a
- * genuine multi-step git operation (read ref -> read tree -> create blob -> create tree ->
- * create commit -> move ref), so a failure partway through can leave an orphaned blob/tree/commit
- * object in the repo — harmless (they're just unreferenced), but the branch ref itself is only
- * ever moved in the last step, so the visible repo state never ends up half-written.
- */
-async function commitLargeFileToGitHub(token: string, branch: string, filePath: string, message: string, base64Content: string): Promise<{ success: boolean, error?: string }> {
-    const apiBase = "https://api.github.com/repos/YaserZarifi/daily-dev-journal";
-    const headers = {
-        "Authorization": `Bearer ${token}`,
-        "User-Agent": "Cloudflare-Worker",
-        "Accept": "application/vnd.github.v3+json",
-        "Content-Type": "application/json"
-    };
-
-    try {
-        const refResp = await fetch(`${apiBase}/git/refs/heads/${branch}`, { headers });
-        if (!refResp.ok) return { success: false, error: `Failed to read branch ref (${refResp.status}): ${await refResp.text()}` };
-        const refData: any = await refResp.json();
-        const parentCommitSha = refData.object.sha;
-
-        const commitResp = await fetch(`${apiBase}/git/commits/${parentCommitSha}`, { headers });
-        if (!commitResp.ok) return { success: false, error: `Failed to read parent commit (${commitResp.status}): ${await commitResp.text()}` };
-        const commitData: any = await commitResp.json();
-        const baseTreeSha = commitData.tree.sha;
-
-        const blobResp = await fetch(`${apiBase}/git/blobs`, {
-            method: "POST", headers,
-            body: JSON.stringify({ content: base64Content, encoding: "base64" })
-        });
-        if (!blobResp.ok) return { success: false, error: `Failed to create blob (${blobResp.status}): ${await blobResp.text()}` };
-        const blobData: any = await blobResp.json();
-
-        const treeResp = await fetch(`${apiBase}/git/trees`, {
-            method: "POST", headers,
-            body: JSON.stringify({
-                base_tree: baseTreeSha,
-                tree: [{ path: filePath, mode: "100644", type: "blob", sha: blobData.sha }]
-            })
-        });
-        if (!treeResp.ok) return { success: false, error: `Failed to create tree (${treeResp.status}): ${await treeResp.text()}` };
-        const treeData: any = await treeResp.json();
-
-        const newCommitResp = await fetch(`${apiBase}/git/commits`, {
-            method: "POST", headers,
-            body: JSON.stringify({ message, tree: treeData.sha, parents: [parentCommitSha] })
-        });
-        if (!newCommitResp.ok) return { success: false, error: `Failed to create commit (${newCommitResp.status}): ${await newCommitResp.text()}` };
-        const newCommitData: any = await newCommitResp.json();
-
-        const updateRefResp = await fetch(`${apiBase}/git/refs/heads/${branch}`, {
-            method: "PATCH", headers,
-            body: JSON.stringify({ sha: newCommitData.sha })
-        });
-        if (!updateRefResp.ok) return { success: false, error: `Failed to update branch ref (${updateRefResp.status}): ${await updateRefResp.text()}` };
-
-        return { success: true };
-    } catch (err) {
-        return { success: false, error: err instanceof Error ? err.message : String(err) };
-    }
-}
-
-async function commitToGitHub(token: string, folderName: string, fileName: string, message: string, content: string, isBase64: boolean = false, branch: string = "main"): Promise<{ success: boolean, error?: string }> {
+async function commitToGitHub(token: string, folderName: string, fileName: string, message: string, content: string, isBase64: boolean = false): Promise<{ success: boolean, error?: string }> {
     const filePath = folderName ? `${folderName}/${fileName}` : fileName;
-
-    // Large payloads (mainly photos) can't go through the single-request Contents API below.
-    if (isBase64 && content.length > GITHUB_CONTENTS_API_SIZE_LIMIT) {
-        return commitLargeFileToGitHub(token, branch, filePath, message, content);
-    }
-
     const encodedPath = filePath.split('/').map(segment => encodeURIComponent(segment)).join('/');
     const repoUrl = `https://api.github.com/repos/YaserZarifi/daily-dev-journal/contents/${encodedPath}`;
 
@@ -915,7 +835,7 @@ async function handleIncomingMessage(payloadMessage: any, chatId: string, env: E
             await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, "No entries committed yet.");
             return;
         }
-        const branch = env.GITHUB_BRANCH || "main";
+        const branch = "main";
         const lines = entries.map(e => `• ${e.date}: https://github.com/YaserZarifi/daily-dev-journal/blob/${branch}/${e.path}`);
         await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, `📚 Last ${entries.length} entries:\n\n${lines.join("\n")}`);
         return;
@@ -1079,8 +999,7 @@ async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env)
             imageFileName,
             `Upload asset: ${imageFileName}`,
             base64Image,
-            true,
-            env.GITHUB_BRANCH || "main"
+            true
         );
 
         // Images live under the WEEK folder (`${weekFolder}/assets/...`), but this markdown
