@@ -225,6 +225,44 @@ async function answerCallbackQuery(token: string, callbackQueryId: string): Prom
 }
 
 /**
+ * Best-effort broadcast to every allowed chat. Used for background events (cron jobs,
+ * webhook-level events) that don't have a single "requesting" chat to reply to. Failures
+ * here are only logged to console, never thrown, so a Telegram hiccup can't mask the
+ * original event that triggered the notification.
+ */
+async function notifyAllowedChats(env: Env, text: string): Promise<void> {
+    const allowedIds = env.ALLOWED_CHAT_IDS.split(",").map(id => id.trim()).filter(Boolean);
+    for (const chatId of allowedIds) {
+        try {
+            await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, text);
+        } catch (err) {
+            console.error(`Failed to notify chat ${chatId}:`, err);
+        }
+    }
+}
+
+/**
+ * ==========================================
+ * MODULE: HUMAN-READABLE ACTIVITY LOG
+ * ==========================================
+ * A plain-English activity feed sent straight to Telegram, distinct from console.error/
+ * wrangler tail (which stay as-is for technical debugging). Every notable event — success,
+ * failure, or a quiet background thing you'd otherwise never see (a duplicate delivery
+ * getting dropped, an album being consolidated, an unauthorized request being blocked) —
+ * gets its own short message here so you have a readable trail of what the bot has been
+ * doing, without digging through logs.
+ */
+async function logEvent(env: Env, level: "success" | "info" | "warn" | "error", text: string): Promise<void> {
+    const icons: Record<typeof level, string> = {
+        success: "✅",
+        info: "ℹ️",
+        warn: "⚠️",
+        error: "❌"
+    };
+    await notifyAllowedChats(env, `${icons[level]} ${truncateForTelegram(text)}`);
+}
+
+/**
  * ==========================================
  * MODULE: GITHUB SERVICES
  * ==========================================
@@ -341,8 +379,8 @@ async function commitToGitHub(token: string, folderName: string, fileName: strin
  * Regenerates the README.md index for a given week folder, listing each day's
  * entry count so the week is browsable on GitHub without opening every file.
  */
-async function updateWeekReadme(token: string, kv: KVNamespace, weekFolder: string): Promise<void> {
-    const entries = await getWeeklyEntries(kv, weekFolder);
+async function updateWeekReadme(env: Env, weekFolder: string): Promise<void> {
+    const entries = await getWeeklyEntries(env.JOURNAL_KV, weekFolder);
 
     // Group entry counts by date
     const countsByDate = new Map<string, number>();
@@ -363,13 +401,12 @@ async function updateWeekReadme(token: string, kv: KVNamespace, weekFolder: stri
         content += `\n**Total this week:** ${entries.length}\n`;
     }
 
-    // const result = await commitToGitHub(token, weekFolder, "README.md", `Update README for ${weekFolder}`, content);
-// Passing an empty string "" places the README at the root of your repo
-    const result = await commitToGitHub(token, "", "README.md", `Update README for ${weekFolder}`, content);
-
+    // Passing an empty string "" places the README at the root of your repo
+    const result = await commitToGitHub(env.GITHUB_TOKEN, "", "README.md", `Update README for ${weekFolder}`, content);
 
     if (!result.success) {
         console.error(`Failed to update README for ${weekFolder}:`, result.error);
+        await logEvent(env, "error", `Failed to update the weekly README for ${weekFolder}: ${result.error}`);
     }
 }
 
@@ -1021,12 +1058,14 @@ async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env)
     if (result.success) {
         await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Successfully committed to ${finalPaths.folderName}/${finalPaths.fileName}!`);
         await appendRecentEntry(env.JOURNAL_KV, { date: finalPaths.fileDate, path: `${finalPaths.folderName}/${finalPaths.fileName}` });
+        await logEvent(env, "success", `Committed "${finalPaths.fileName}" to ${finalPaths.folderName}${draft.fileId ? " (with photo)" : ""}.`);
         if (draft.original !== "/quote") {
             await appendWeeklyEntry(env.JOURNAL_KV, finalPaths.weekFolder, finalPaths.fileDate, textToCommit);
-            await updateWeekReadme(env.GITHUB_TOKEN, env.JOURNAL_KV, finalPaths.weekFolder);
+            await updateWeekReadme(env, finalPaths.weekFolder);
         }
     } else {
         await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Failed to commit! ${truncateForTelegram(result.error ?? "GitHub responded with an error.")}`);
+        await logEvent(env, "error", `Failed to commit "${finalPaths.fileName}": ${result.error ?? "GitHub responded with an error."}`);
     }
     await env.JOURNAL_KV.delete(draftKey);
 }
@@ -1036,22 +1075,6 @@ async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env)
  * MODULE: CRON JOB HANDLERS
  * ==========================================
  */
-
-/**
- * Best-effort notification to every allowed chat — used by cron tasks, which have no
- * single "requester" to reply to. Failures here are only logged, never thrown, so a
- * Telegram hiccup can't mask the original error that triggered the notification.
- */
-async function notifyAllowedChats(env: Env, text: string): Promise<void> {
-    const allowedIds = env.ALLOWED_CHAT_IDS.split(",").map(id => id.trim()).filter(Boolean);
-    for (const chatId of allowedIds) {
-        try {
-            await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, text);
-        } catch (err) {
-            console.error(`Failed to notify chat ${chatId}:`, err);
-        }
-    }
-}
 
 /**
  * Executes the daily quote generation and commits it directly to GitHub.
@@ -1071,15 +1094,17 @@ async function runDailyQuoteTask(env: Env): Promise<void> {
             quoteContent
         );
 
-        if (!result.success) {
+        if (result.success) {
+            await logEvent(env, "success", `Daily quote posted for ${paths.formattedDate}.`);
+        } else {
             console.error("Daily quote commit failed:", result.error);
-            await notifyAllowedChats(env, `⚠️ Daily quote commit failed: ${truncateForTelegram(result.error ?? "unknown error")}`);
+            await logEvent(env, "error", `Daily quote commit failed: ${result.error ?? "unknown error"}`);
         }
     } catch (err) {
         // Previously unguarded — an AI or network failure here would kill the whole
         // scheduled() invocation with no retry and no record that the day was missed.
         console.error("runDailyQuoteTask crashed:", err);
-        await notifyAllowedChats(env, `⚠️ Daily quote task crashed: ${truncateForTelegram(err instanceof Error ? err.message : String(err))}`);
+        await logEvent(env, "error", `Daily quote task crashed: ${err instanceof Error ? err.message : String(err)}`);
     }
 }
 
@@ -1099,6 +1124,7 @@ async function runWeeklySummaryTask(env: Env): Promise<void> {
 
         if (entries.length === 0) {
             console.log(`No entries to summarize for week ${weekFolder}, skipping.`);
+            await logEvent(env, "info", `No journal entries this week — skipped the weekly summary for ${weekFolder}.`);
             return;
         }
 
@@ -1114,18 +1140,19 @@ async function runWeeklySummaryTask(env: Env): Promise<void> {
 
         if (!result.success) {
             console.error("Weekly summary commit failed:", result.error);
-            await notifyAllowedChats(env, `⚠️ Weekly summary commit failed: ${truncateForTelegram(result.error ?? "unknown error")}`);
+            await logEvent(env, "error", `Weekly summary commit failed: ${result.error ?? "unknown error"}`);
             return; // entries stay in KV so the next run can retry, as before
         }
 
         await clearWeeklyEntries(env.JOURNAL_KV, weekFolder);
-        await updateWeekReadme(env.GITHUB_TOKEN, env.JOURNAL_KV, weekFolder); // reflects cleared count, since a new week's tracking starts fresh
+        await updateWeekReadme(env, weekFolder); // reflects cleared count, since a new week's tracking starts fresh
+        await logEvent(env, "success", `Weekly summary posted for ${weekFolder} (${entries.length} entries).`);
     } catch (err) {
         // Previously unguarded. Note entries are deliberately NOT cleared here (that only
         // happens after a confirmed successful commit above), so a crash mid-task still
         // leaves the week's entries intact for the next scheduled retry.
         console.error("runWeeklySummaryTask crashed:", err);
-        await notifyAllowedChats(env, `⚠️ Weekly summary task crashed: ${truncateForTelegram(err instanceof Error ? err.message : String(err))}`);
+        await logEvent(env, "error", `Weekly summary task crashed: ${err instanceof Error ? err.message : String(err)}`);
     }
 }
 
@@ -1173,6 +1200,7 @@ export default {
         // Reject any request that doesn't carry Telegram's secret token header
         const incomingSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
         if (!incomingSecret || !timingSafeEqual(incomingSecret, env.TELEGRAM_WEBHOOK_SECRET)) {
+            await logEvent(env, "warn", "Blocked a webhook request with a missing or invalid secret token (possible unauthorized probe).");
             return new Response("Unauthorized", { status: 401 });
         }
 
@@ -1181,6 +1209,7 @@ export default {
             payload = await request.json();
         } catch (err) {
             console.error("Invalid JSON payload:", err);
+            await logEvent(env, "error", "Received a webhook request with invalid JSON — ignored it.");
             return new Response("OK");
         }
 
@@ -1189,6 +1218,7 @@ export default {
             const dedupeKey = `seen-update:${payload.update_id}`;
             const alreadySeen = await env.JOURNAL_KV.get(dedupeKey);
             if (alreadySeen) {
+                await logEvent(env, "info", `Ignored a duplicate delivery of update ${payload.update_id} (Telegram retried it).`);
                 return new Response("OK");
             }
             // Short TTL is enough — Telegram retries happen within seconds/minutes, not days
@@ -1203,6 +1233,7 @@ export default {
             const groupKey = `seen-media-group:${payload.message.media_group_id}`;
             const alreadySeenGroup = await env.JOURNAL_KV.get(groupKey);
             if (alreadySeenGroup) {
+                await logEvent(env, "info", "Received another photo from the same album — only processing the first one to avoid duplicate drafts.");
                 return new Response("OK");
             }
             await env.JOURNAL_KV.put(groupKey, "1", { expirationTtl: 300 });
@@ -1225,6 +1256,7 @@ export default {
             if (payload.message) {
                 await sendTelegramMessage(env.TELEGRAM_TOKEN, currentChatId, "You are not authorized to use this bot.");
             }
+            await logEvent(env, "warn", `Blocked a message from an unauthorized chat (ID: ${currentChatId}).`);
             return new Response("OK");
         }
 
@@ -1239,12 +1271,14 @@ export default {
             } catch (err) {
                 console.error("handleIncomingMessage error:", err);
                 await sendTelegramMessage(env.TELEGRAM_TOKEN, currentChatId, "Something went wrong processing that — try again.");
+                await logEvent(env, "error", `Failed to process an incoming message: ${err instanceof Error ? err.message : String(err)}`);
             }
         } else if (payload.callback_query) {
             try {
                 await handleCallbackQuery(payload.callback_query, currentChatId, env);
             } catch (err) {
                 console.error("handleCallbackQuery error:", err);
+                await logEvent(env, "error", `Failed to process a button action: ${err instanceof Error ? err.message : String(err)}`);
                 // Previously this only logged, leaving the user staring at a message whose
                 // Accept/Reject buttons had already fired with no visible outcome. Now we at
                 // least try to tell them it failed instead of going silent on this path too.
