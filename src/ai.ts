@@ -6,6 +6,26 @@
 
 import { TAGS } from "./constants";
 
+/**
+ * Strips markdown code fences and any stray prose around a JSON object/array so that
+ * JSON.parse can still succeed even if the model didn't follow the "no fences, no extra
+ * text" instruction exactly. Without this, a single stray ```json fence or a leading
+ * sentence silently breaks JSON.parse and triggers the caller's fallback path.
+ */
+function extractJsonPayload(raw: string): string {
+    let cleaned = raw.trim();
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+    const firstBrace = cleaned.indexOf("{");
+    const firstBracket = cleaned.indexOf("[");
+    const candidates = [firstBrace, firstBracket].filter(i => i !== -1);
+    if (candidates.length === 0) return cleaned;
+    const start = Math.min(...candidates);
+    const isObject = cleaned[start] === "{";
+    const end = isObject ? cleaned.lastIndexOf("}") : cleaned.lastIndexOf("]");
+    if (end === -1 || end < start) return cleaned;
+    return cleaned.slice(start, end + 1);
+}
+
 export async function refineTextWithAI(ai: any, text: string): Promise<string> {
     const response: any = await ai.run("@cf/meta/llama-4-scout-17b-16e-instruct", {
         messages: [
@@ -53,7 +73,8 @@ Return ONLY the final Markdown journal entry.
 The first character of your response must be '#'.`
             },
             { role: "user", content: text }
-        ]
+        ],
+        max_tokens: 2048
     });
 
     if (!response?.response || typeof response.response !== "string") {
@@ -63,42 +84,90 @@ The first character of your response must be '#'.`
     return response.response;
 }
 
+// /**
+//  * Produces a grammar-only corrected version of the text, distinct from refineTextWithAI's
+//  * creative rewrite. If the input isn't English, the source is left untouched (never
+//  * AI-edited) and only a faithful, grammar-corrected English translation is produced.
+//  */
+// export async function correctTextWithAI(ai: any, text: string): Promise<{ language: "en" | "other", correctedEnglish: string }> {
+//     const response: any = await ai.run("@cf/meta/llama-4-scout-17b-16e-instruct", {
+//         messages: [
+//             {
+//                 role: "system",
+//                 content: `You are a precise grammar corrector, not a creative editor.
+
+// Task:
+// 1. Detect whether the input text is written in English or another language.
+// 2. Produce a grammatically corrected English version of the text:
+//    - If the input is English: fix grammar, spelling, and punctuation ONLY. Do not add, remove, or embellish content. Do not change tone or style.
+//    - If the input is not English: translate it into English as faithfully and literally as possible.
+
+// Return ONLY a JSON object in exactly this shape, nothing else, no markdown code fences:
+// {"language": "en", "corrected_english": "..."}`
+//             },
+//             { role: "user", content: text }
+//         ],
+//         max_tokens: 2048
+//     });
+
+//     try {
+//         const raw = typeof response?.response === "string" ? response.response : "";
+//         const parsed = JSON.parse(extractJsonPayload(raw));
+//         const language = parsed.language === "en" ? "en" : "other";
+//         const correctedEnglish = typeof parsed.corrected_english === "string" ? parsed.corrected_english : text;
+//         return { language, correctedEnglish };
+//     } catch (err) {
+//         // If the model didn't return valid JSON, fall back to the raw text rather than
+//         // losing the entry — better an uncorrected commit than a crashed one. Logged so
+//         // truncation/format issues are visible in `wrangler tail` instead of silent.
+//         console.error("correctTextWithAI: failed to parse AI response as JSON", err, response?.response);
+//         return { language: "en", correctedEnglish: text };
+//     }
+// }
+
+/**
+ * True if text contains no Persian/Arabic-script characters. Used to decide English vs.
+ * non-English deterministically in code, rather than asking the model to self-report its
+ * own input language inside a JSON field — that self-report kept silently failing (or
+ * defaulting to "en" on a parse error) and mislabeling non-English entries as English.
+ */
+function looksEnglish(text: string): boolean {
+    const persoArabicPattern = /[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]/;
+    return !persoArabicPattern.test(text);
+}
+
 /**
  * Produces a grammar-only corrected version of the text, distinct from refineTextWithAI's
  * creative rewrite. If the input isn't English, the source is left untouched (never
  * AI-edited) and only a faithful, grammar-corrected English translation is produced.
+ *
+ * Language is detected in code (see looksEnglish) rather than asked of the model, and the
+ * model is asked for plain text rather than JSON — both changes exist specifically because
+ * the previous self-reported-JSON approach kept failing unpredictably on non-English input.
  */
 export async function correctTextWithAI(ai: any, text: string): Promise<{ language: "en" | "other", correctedEnglish: string }> {
+    const language: "en" | "other" = looksEnglish(text) ? "en" : "other";
+
+    const systemPrompt = language === "en"
+        ? `You are a precise grammar corrector, not a creative editor.
+Fix grammar, spelling, and punctuation ONLY in the text below. Do not add, remove, or embellish content. Do not change tone or style.
+Return ONLY the corrected text and nothing else: no preamble, no quotes, no markdown code fences, no explanation.`
+        : `You are a precise, literal translator and grammar corrector, not a creative editor.
+Translate the text below into English as faithfully and literally as possible, then apply grammar/spelling/punctuation-only correction to that translation. Do not add content, opinions, or interpretation.
+Return ONLY the English translation and nothing else: no preamble, no quotes, no markdown code fences, no explanation.`;
+
     const response: any = await ai.run("@cf/meta/llama-4-scout-17b-16e-instruct", {
         messages: [
-            {
-                role: "system",
-                content: `You are a precise grammar corrector, not a creative editor.
-
-Task:
-1. Detect whether the input text is written in English or another language.
-2. Produce a grammatically corrected English version of the text:
-   - If the input is English: fix grammar, spelling, and punctuation ONLY. Do not add, remove, or embellish content. Do not change tone or style.
-   - If the input is not English: translate it into English as faithfully and literally as possible, then apply the same grammar/spelling/punctuation-only correction. Do not add content, opinions, or interpretation.
-
-Return ONLY a JSON object in exactly this shape, nothing else, no markdown code fences:
-{"language": "en", "corrected_english": "..."}`
-            },
+            { role: "system", content: systemPrompt },
             { role: "user", content: text }
-        ]
+        ],
+        max_tokens: 2048
     });
 
-    try {
-        const raw = typeof response?.response === "string" ? response.response : "";
-        const parsed = JSON.parse(raw.trim());
-        const language = parsed.language === "en" ? "en" : "other";
-        const correctedEnglish = typeof parsed.corrected_english === "string" ? parsed.corrected_english : text;
-        return { language, correctedEnglish };
-    } catch (err) {
-        // If the model didn't return valid JSON, fall back to the raw text rather than
-        // losing the entry — better an uncorrected commit than a crashed one.
-        return { language: "en", correctedEnglish: text };
-    }
+    const raw = typeof response?.response === "string" ? response.response.trim() : "";
+    const correctedEnglish = raw.length > 0 ? raw : text;
+
+    return { language, correctedEnglish };
 }
 
 /**
@@ -119,15 +188,30 @@ Rules:
 - Return ONLY a JSON array of strings, nothing else, no markdown code fences. Example: ["coding", "milestone"]`
             },
             { role: "user", content: text }
-        ]
+        ],
+        max_tokens: 128
     });
 
     try {
         const raw = typeof response?.response === "string" ? response.response : "";
-        const parsed = JSON.parse(raw.trim());
+        const parsed = JSON.parse(extractJsonPayload(raw));
         if (!Array.isArray(parsed)) return [];
-        return parsed.filter((t: any) => typeof t === "string" && TAGS.includes(t)).slice(0, 3);
+        const normalizedTags = TAGS.map(t => t.toLowerCase());
+        const seen = new Set<string>();
+        const result: string[] = [];
+        for (const t of parsed) {
+            if (typeof t !== "string") continue;
+            const idx = normalizedTags.indexOf(t.trim().toLowerCase());
+            if (idx === -1) continue;
+            const canonical = TAGS[idx];
+            if (seen.has(canonical)) continue;
+            seen.add(canonical);
+            result.push(canonical);
+            if (result.length === 3) break;
+        }
+        return result;
     } catch (err) {
+        console.error("suggestTagsWithAI: failed to parse AI response as JSON", err, response?.response);
         return [];
     }
 }
@@ -140,7 +224,8 @@ export async function generateQuoteWithAI(ai: any): Promise<string> {
     const response: any = await ai.run("@cf/meta/llama-4-scout-17b-16e-instruct", {
         messages: [
             { role: "system", content: `You are an assistant. Provide a single, inspiring, profound quote about ${randomTopic}. Only return the quote and the author. No introductory text. (Seed: ${randomSeed})` }
-        ]
+        ],
+        max_tokens: 256
     });
     return response.response;
 }
@@ -157,7 +242,8 @@ Write a warm, reflective summary of the week: identify key themes, progress, rec
 Keep it concise (roughly 150-250 words). Return ONLY the summary, no headers, no preamble.`
             },
             { role: "user", content: combined }
-        ]
+        ],
+        max_tokens: 1024
     });
     return response.response;
 }
