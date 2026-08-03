@@ -193,8 +193,13 @@ Rules:
     });
 
     try {
-        const raw = typeof response?.response === "string" ? response.response : "";
-        const parsed = JSON.parse(extractJsonPayload(raw));
+        const raw = response?.response;
+        // Workers AI sometimes hands back an already-parsed array (not a JSON string) here,
+        // depending on the model/binding — that's exactly what was silently breaking this
+        // before: JSON.parse("") on a non-string raw always throws.
+        const parsed: unknown = Array.isArray(raw)
+            ? raw
+            : JSON.parse(extractJsonPayload(typeof raw === "string" ? raw : ""));
         if (!Array.isArray(parsed)) return [];
         const normalizedTags = TAGS.map(t => t.toLowerCase());
         const seen = new Set<string>();
