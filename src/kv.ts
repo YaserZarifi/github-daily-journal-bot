@@ -99,3 +99,36 @@ export async function getRecentEntries(kv: KVNamespace): Promise<{ date: string,
     const raw = await kv.get("recent-entries");
     return raw ? JSON.parse(raw) : [];
 }
+
+/**
+ * Holds a journal entry's raw text/photo while the user is picking a mood for it,
+ * before any AI processing happens. One pending entry per chat at a time.
+ */
+export async function setPendingEntry(kv: KVNamespace, chatId: string, entry: { text: string, fileId: string | null }): Promise<void> {
+    await kv.put(`pending-entry:${chatId}`, JSON.stringify(entry), { expirationTtl: 3600 });
+}
+
+export async function getPendingEntry(kv: KVNamespace, chatId: string): Promise<{ text: string, fileId: string | null } | null> {
+    const raw = await kv.get(`pending-entry:${chatId}`);
+    return raw ? JSON.parse(raw) : null;
+}
+
+export async function clearPendingEntry(kv: KVNamespace, chatId: string): Promise<void> {
+    await kv.delete(`pending-entry:${chatId}`);
+}
+
+/**
+ * Flags that the next plain-text message from this chat is a custom mood name
+ * (typed after tapping "Other" on the mood keyboard), not a new journal entry.
+ */
+export async function setAwaitingCustomMood(kv: KVNamespace, chatId: string): Promise<void> {
+    await kv.put(`awaiting-custom-mood:${chatId}`, "1", { expirationTtl: 3600 });
+}
+
+export async function isAwaitingCustomMood(kv: KVNamespace, chatId: string): Promise<boolean> {
+    return (await kv.get(`awaiting-custom-mood:${chatId}`)) !== null;
+}
+
+export async function clearAwaitingCustomMood(kv: KVNamespace, chatId: string): Promise<void> {
+    await kv.delete(`awaiting-custom-mood:${chatId}`);
+}

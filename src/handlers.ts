@@ -7,12 +7,29 @@
 import type { Env } from "./types";
 import { sendTelegramMessage, editTelegramMessage, answerCallbackQuery, getTelegramFileUrl, downloadTelegramFileAsBase64, logEvent } from "./telegram";
 import { commitToGitHub, updateWeekReadme } from "./github";
-import { getDailyCount, incrementAndGetDailyCount, calculateStreak, appendWeeklyEntry, appendRecentEntry, getRecentEntries } from "./kv";
-import { refineTextWithAI, generateQuoteWithAI } from "./ai";
-import { getRepoPaths, truncateForTelegram } from "./utils";
+import {
+    getDailyCount, incrementAndGetDailyCount, calculateStreak, appendWeeklyEntry, appendRecentEntry, getRecentEntries,
+    setPendingEntry, getPendingEntry, clearPendingEntry,
+    setAwaitingCustomMood, isAwaitingCustomMood, clearAwaitingCustomMood
+} from "./kv";
+import { refineTextWithAI, generateQuoteWithAI, correctTextWithAI, suggestTagsWithAI } from "./ai";
+import { getRepoPaths, truncateForTelegram, buildCorrectedBlock } from "./utils";
+import { MOODS } from "./constants";
 
 export async function handleIncomingMessage(payloadMessage: any, chatId: string, env: Env): Promise<void> {
     const originalText = payloadMessage.text || payloadMessage.caption || "A visual moment captured.";
+
+    if (await isAwaitingCustomMood(env.JOURNAL_KV, chatId)) {
+        await clearAwaitingCustomMood(env.JOURNAL_KV, chatId);
+        const pending = await getPendingEntry(env.JOURNAL_KV, chatId);
+        if (!pending) {
+            await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, "That entry expired — send it again.");
+            return;
+        }
+        await clearPendingEntry(env.JOURNAL_KV, chatId);
+        await processEntryWithMood(env, chatId, pending.text, pending.fileId, originalText.trim());
+        return;
+    }
 
     if (originalText === "/stats") {
         const paths = getRepoPaths(new Date(), "");
@@ -82,6 +99,8 @@ export async function handleIncomingMessage(payloadMessage: any, chatId: string,
         for (const key of list.keys) {
             await env.JOURNAL_KV.delete(key.name);
         }
+        await clearPendingEntry(env.JOURNAL_KV, chatId);
+        await clearAwaitingCustomMood(env.JOURNAL_KV, chatId);
         await sendTelegramMessage(
             env.TELEGRAM_TOKEN,
             chatId,
@@ -95,15 +114,45 @@ export async function handleIncomingMessage(payloadMessage: any, chatId: string,
         fileId = payloadMessage.photo[payloadMessage.photo.length - 1].file_id;
     }
 
-    const refinedText = await refineTextWithAI(env.AI, originalText);
-    const messageToSend = `Original:\n${originalText}\n\nRefined:\n${refinedText}`;
+    await setPendingEntry(env.JOURNAL_KV, chatId, { text: originalText, fileId });
+
+    const moodButtons: any[] = [];
+    for (let i = 0; i < MOODS.length; i += 2) {
+        const row = [{ text: `${MOODS[i].emoji} ${MOODS[i].label}`, callback_data: `mood:${i}` }];
+        if (MOODS[i + 1]) {
+            row.push({ text: `${MOODS[i + 1].emoji} ${MOODS[i + 1].label}`, callback_data: `mood:${i + 1}` });
+        }
+        moodButtons.push(row);
+    }
+    moodButtons.push([{ text: "✏️ Other (type your own)", callback_data: "mood:other" }]);
+
+    await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, "How are you feeling right now?", {
+        inline_keyboard: moodButtons
+    });
+}
+
+/**
+ * Runs the refine / grammar-correct / tag-suggest AI calls for a pending entry once its
+ * mood is known, then sends the three-way (Refined / Corrected / Original) draft message
+ * with commit buttons.
+ */
+async function processEntryWithMood(env: Env, chatId: string, originalText: string, fileId: string | null, mood: string): Promise<void> {
+    const [refinedText, corrected, tags] = await Promise.all([
+        refineTextWithAI(env.AI, originalText),
+        correctTextWithAI(env.AI, originalText),
+        suggestTagsWithAI(env.AI, originalText)
+    ]);
+
+    const correctedBlock = buildCorrectedBlock(originalText, corrected.language, corrected.correctedEnglish);
+    const messageToSend = `Original:\n${originalText}\n\nCorrected:\n${correctedBlock}\n\nRefined:\n${refinedText}`;
 
     const messageId = await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageToSend, {
         inline_keyboard: [
             [
-                { text: "Accept", callback_data: "commit_refined" },
-                { text: "Commit Original", callback_data: "commit_original" }
+                { text: "Accept Refined", callback_data: "commit_refined" },
+                { text: "Commit Corrected", callback_data: "commit_corrected" }
             ],
+            [{ text: "Commit Original", callback_data: "commit_original" }],
             [{ text: "Reject", callback_data: "reject" }]
         ]
     });
@@ -111,7 +160,7 @@ export async function handleIncomingMessage(payloadMessage: any, chatId: string,
     if (messageId) {
         await env.JOURNAL_KV.put(
             `draft:${chatId}:${messageId}`,
-            JSON.stringify({ original: originalText, refined: refinedText, fileId: fileId }),
+            JSON.stringify({ original: originalText, refined: refinedText, corrected: correctedBlock, mood, tags, fileId }),
             { expirationTtl: 86400 }
         );
     }
@@ -120,9 +169,36 @@ export async function handleIncomingMessage(payloadMessage: any, chatId: string,
 export async function handleCallbackQuery(callbackQuery: any, chatId: string, env: Env): Promise<void> {
     const messageId = callbackQuery.message.message_id;
     const data = callbackQuery.data;
-    const draftKey = `draft:${chatId}:${messageId}`;
 
     await answerCallbackQuery(env.TELEGRAM_TOKEN, callbackQuery.id);
+
+    if (typeof data === "string" && data.startsWith("mood:")) {
+        const pending = await getPendingEntry(env.JOURNAL_KV, chatId);
+        if (!pending) {
+            await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, "This entry expired — send it again.");
+            return;
+        }
+
+        if (data === "mood:other") {
+            await setAwaitingCustomMood(env.JOURNAL_KV, chatId);
+            await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, "Type your mood as a quick word or two:");
+            return;
+        }
+
+        const moodIndex = parseInt(data.split(":")[1], 10);
+        const mood = MOODS[moodIndex];
+        if (!mood) {
+            await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, "Unrecognized mood — send the entry again.");
+            return;
+        }
+
+        await clearPendingEntry(env.JOURNAL_KV, chatId);
+        await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Mood: ${mood.emoji} ${mood.label}. Refining your entry...`);
+        await processEntryWithMood(env, chatId, pending.text, pending.fileId, `${mood.emoji} ${mood.label}`);
+        return;
+    }
+
+    const draftKey = `draft:${chatId}:${messageId}`;
 
     if (data === "reject") {
         await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, "Entry rejected and discarded.");
@@ -137,14 +213,19 @@ export async function handleCallbackQuery(callbackQuery: any, chatId: string, en
     }
     const draft = JSON.parse(draftRaw);
 
-    await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, "⏳ Committing your entry...");
-
     let textToCommit = "";
     if (data === "commit_refined") {
         textToCommit = draft.refined;
+    } else if (data === "commit_corrected") {
+        textToCommit = draft.corrected;
     } else if (data === "commit_original") {
         textToCommit = draft.original;
+    } else {
+        await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, "Unrecognized action — try the button again.");
+        return;
     }
+
+    await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, "⏳ Committing your entry...");
 
     const now = new Date();
     const paths = getRepoPaths(now, "Journal");
@@ -170,6 +251,18 @@ export async function handleCallbackQuery(callbackQuery: any, chatId: string, en
         );
 
         textToCommit += `\n\n![Visual Context](../assets/${imageFileName})`;
+    }
+
+    if (draft.mood) {
+        const frontmatter = [
+            "---",
+            `date: ${finalPaths.fileDate}`,
+            `mood: "${draft.mood}"`,
+            `tags: [${(draft.tags || []).join(", ")}]`,
+            "---",
+            ""
+        ].join("\n");
+        textToCommit = frontmatter + "\n" + textToCommit;
     }
 
     const result = await commitToGitHub(

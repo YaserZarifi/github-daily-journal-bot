@@ -26,6 +26,18 @@ export function truncateForTelegram(text: string, maxLength: number = 300): stri
 }
 
 /**
+ * Builds the "Corrected" text block. English input: just the corrected text. Non-English
+ * input: the original is left untouched (never AI-edited) followed by a separator and the
+ * corrected English translation.
+ */
+export function buildCorrectedBlock(originalText: string, language: "en" | "other", correctedEnglish: string): string {
+    if (language === "en") {
+        return correctedEnglish;
+    }
+    return `${originalText}\n\n---\n\n${correctedEnglish}`;
+}
+
+/**
  * Computes the ISO 8601 week number and week-year for a given calendar date.
  * Handles year-boundary weeks correctly (e.g. late-Dec dates can belong to week 1 of next year).
  */
