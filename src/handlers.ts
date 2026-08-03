@@ -137,20 +137,25 @@ export async function handleIncomingMessage(payloadMessage: any, chatId: string,
  * with commit buttons.
  */
 async function processEntryWithMood(env: Env, chatId: string, originalText: string, fileId: string | null, mood: string): Promise<void> {
-    const [refinedText, corrected, tags] = await Promise.all([
-        refineTextWithAI(env.AI, originalText),
+    const [corrected, tags] = await Promise.all([
         correctTextWithAI(env.AI, originalText),
         suggestTagsWithAI(env.AI, originalText)
     ]);
 
+    // Refine always runs on guaranteed-English text: the original if it's already English,
+    // or correctTextWithAI's translation if not. This is deliberately sequential (rather than
+    // parallel with correctTextWithAI) so "Refined" can never come back in the source language.
+    const refinedText = await refineTextWithAI(env.AI, corrected.language === "en" ? originalText : corrected.correctedEnglish);
+
     const correctedBlock = buildCorrectedBlock(originalText, corrected.language, corrected.correctedEnglish);
-    const messageToSend = `Original:\n${originalText}\n\nCorrected:\n${correctedBlock}\n\nRefined:\n${refinedText}`;
+    const correctedLabel = corrected.language === "en" ? "Corrected" : "Translated";
+    const messageToSend = `Original:\n${originalText}\n\n${correctedLabel}:\n${corrected.correctedEnglish}\n\nRefined:\n${refinedText}`;
 
     const messageId = await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageToSend, {
         inline_keyboard: [
             [
                 { text: "Accept Refined", callback_data: "commit_refined" },
-                { text: "Commit Corrected", callback_data: "commit_corrected" }
+                { text: corrected.language === "en" ? "Commit Corrected" : "Commit Translated", callback_data: "commit_corrected" }
             ],
             [{ text: "Commit Original", callback_data: "commit_original" }],
             [{ text: "Reject", callback_data: "reject" }]
