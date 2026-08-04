@@ -184,7 +184,7 @@ export async function updateWeekReadme(env: Env, weekFolder: string): Promise<vo
 
 const REPO_OWNER = "YaserZarifi";
 const REPO_NAME = "daily-dev-journal";
-const API_BASE = `[https://api.github.com/repos/$](https://api.github.com/repos/$){REPO_OWNER}/${REPO_NAME}`;
+const API_BASE = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}`;
 
 
 async function githubFetch(url: string, token: string, method: string = "GET", body?: any) {
