@@ -322,7 +322,15 @@ export async function handleCallbackQuery(callbackQuery: any, chatId: string, en
     if (draft.original === "/quote") {
         commitMessage = `quote: ${finalPaths.formattedDate}`;
     } else if (draft.tags && draft.tags.length > 0) {
-        commitMessage = `journal(${draft.tags[0]}): ${finalPaths.formattedDate}`;
+        const tag = draft.tags[0];
+        if (tag === "bug-fix") commitMessage = `fix(code): ${finalPaths.formattedDate}`;
+        else if (tag === "coding" || tag === "project") commitMessage = `feat(dev): ${finalPaths.formattedDate}`;
+        else if (tag === "learning" || tag === "idea") commitMessage = `docs(knowledge): ${finalPaths.formattedDate}`;
+        else if (tag === "planning" || tag === "milestone") commitMessage = `chore(roadmap): ${finalPaths.formattedDate}`;
+        else if (tag === "routine" || tag === "health") commitMessage = `chore(life): ${finalPaths.formattedDate}`;
+        else if (tag === "reflection" || tag === "frustration" || tag === "gratitude") commitMessage = `journal(mindset): ${finalPaths.formattedDate}`;
+        else if (tag === "family" || tag === "social" || tag === "travel") commitMessage = `journal(life): ${finalPaths.formattedDate}`;
+        else commitMessage = `journal(${tag}): ${finalPaths.formattedDate}`;
     }
 
     if (draft.mood) {
