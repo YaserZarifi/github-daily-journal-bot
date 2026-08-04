@@ -317,6 +317,14 @@ export async function handleCallbackQuery(callbackQuery: any, chatId: string, en
         textToCommit += `\n\n![Visual Context](../assets/${imageFileName})`;
     }
 
+    let commitMessage = `journal: ${finalPaths.formattedDate}`;
+
+    if (draft.original === "/quote") {
+        commitMessage = `quote: ${finalPaths.formattedDate}`;
+    } else if (draft.tags && draft.tags.length > 0) {
+        commitMessage = `journal(${draft.tags[0]}): ${finalPaths.formattedDate}`;
+    }
+
     if (draft.mood) {
         const frontmatter = [
             "---",
@@ -333,7 +341,7 @@ export async function handleCallbackQuery(callbackQuery: any, chatId: string, en
         env.GITHUB_TOKEN,
         finalPaths.folderName,
         finalPaths.fileName,
-        `Journal Entry: ${finalPaths.formattedDate}`,
+        commitMessage,
         textToCommit,
         false
     );
