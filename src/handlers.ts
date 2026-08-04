@@ -15,7 +15,7 @@ import {
 } from "./kv";
 import { refineTextWithAI, generateQuoteWithAI, correctTextWithAI, suggestTagsWithAI } from "./ai";
 import { getRepoPaths, truncateForTelegram, buildCorrectedBlock } from "./utils";
-import { MOODS } from "./constants";
+import { MOODS, TEMPLATES } from "./constants";
 
 export async function handleIncomingMessage(payloadMessage: any, chatId: string, env: Env): Promise<void> {
     const originalText = payloadMessage.text || payloadMessage.caption || "A visual moment captured.";
@@ -82,11 +82,33 @@ export async function handleIncomingMessage(payloadMessage: any, chatId: string,
             "/stats — today's entry count\n" +
             "/streak — current journaling streak\n" +
             "/quote — generate a quote to commit\n" +
+            "/template — choose a structured journaling prompt\n" +
             "/recent — links to your last 10 committed entries\n" +
             "/cancel — discard any pending drafts\n" +
             "/help — show this message\n\n" +
             "Or just send text, or a photo with an optional caption, to draft a new journal entry."
         );
+        return;
+    }
+
+    if (originalText.startsWith("/template")) {
+        const parts = originalText.split(" ");
+        const requested = parts[1]?.toLowerCase();
+
+        if (requested && TEMPLATES[requested]) {
+            const msg = `Here is your *${requested}* template. Tap the box below to copy it, then paste and fill it out:\n\n\`\`\`\n${TEMPLATES[requested]}\n\`\`\``;
+            await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, msg, "Markdown");
+            return;
+        }
+
+        const buttons = Object.keys(TEMPLATES).map(key => ([{
+            text: `📝 ${key.charAt(0).toUpperCase() + key.slice(1)}`,
+            callback_data: `template:${key}`
+        }]));
+
+        await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, "Choose a journaling template:", {
+            inline_keyboard: buttons
+        });
         return;
     }
 
@@ -185,6 +207,18 @@ export async function handleCallbackQuery(callbackQuery: any, chatId: string, en
     const data = callbackQuery.data;
 
     await answerCallbackQuery(env.TELEGRAM_TOKEN, callbackQuery.id);
+
+    if (typeof data === "string" && data.startsWith("template:")) {
+        const templateKey = data.split(":")[1];
+        const templateText = TEMPLATES[templateKey];
+
+        if (templateText) {
+            const msg = `Here is your *${templateKey}* template. Tap the box below to copy it, then paste and fill it out:\n\n\`\`\`\n${templateText}\n\`\`\``;
+            await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, "Template selected!");
+            await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, msg, "Markdown");
+        }
+        return;
+    }
 
     if (typeof data === "string" && data.startsWith("mood:")) {
         const pending = await getPendingEntry(env.JOURNAL_KV, chatId);

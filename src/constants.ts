@@ -27,3 +27,11 @@ export const TAGS: string[] = [
     // Daily life
     "family", "health", "social", "travel", "routine"
 ];
+
+
+
+export const TEMPLATES: Record<string, string> = {
+    gratitude: "🙏 Gratitude Journal\n\n1. Today I am grateful for:\n- \n\n2. What went well today:\n- \n\n3. One thing I could have done better:\n- ",
+    retro: "🔄 Weekly Retro\n\n- What went well:\n- \n- What didn't go well:\n- \n- What I learned:\n- \n- Action items for next week:\n- ",
+    standup: "🧍 Daily Standup\n\n- What I did yesterday:\n- \n- What I will do today:\n- \n- Blockers:\n- "
+};
