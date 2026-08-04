@@ -217,16 +217,61 @@ export async function ensureBranchExists(token: string, branchName: string): Pro
     return createRes.ok;
 }
 
+// export async function mergePendingPullRequests(token: string, currentWeekFolder: string): Promise<string> {
+//     const results: string[] = [];
+//     const branchName = `week/${currentWeekFolder}`;
+
+//     await githubFetch(`${API_BASE}/pulls`, token, "POST", {
+//         title: `Journal Entries: ${currentWeekFolder}`,
+//         body: `Automated merge of journal entries for ${currentWeekFolder}.`,
+//         head: branchName,
+//         base: "main"
+//     });
+
+//     const openPrsRes = await githubFetch(`${API_BASE}/pulls?state=open`, token);
+//     if (!openPrsRes.ok) {
+//         return "❌ Failed to fetch open Pull Requests from GitHub.";
+//     }
+
+//     const openPrs = await openPrsRes.json() as any[];
+
+//     if (openPrs.length === 0) {
+//         return "✅ Everything is up to date! No pending PRs or unmerged commits.";
+//     }
+
+//     for (const pr of openPrs) {
+//         const mergeRes = await githubFetch(`${API_BASE}/pulls/${pr.number}/merge`, token, "PUT", {
+//             merge_method: "squash"
+//         });
+
+//         if (mergeRes.ok) {
+//             results.push(`✅ Merged: ${pr.title}`);
+//         } else {
+//             results.push(`❌ Failed to merge: ${pr.title}`);
+//         }
+//     }
+
+//     return results.join("\n");
+// }
+
+
 export async function mergePendingPullRequests(token: string, currentWeekFolder: string): Promise<string> {
     const results: string[] = [];
     const branchName = `week/${currentWeekFolder}`;
 
-    await githubFetch(`${API_BASE}/pulls`, token, "POST", {
+    const createPrRes = await githubFetch(`${API_BASE}/pulls`, token, "POST", {
         title: `Journal Entries: ${currentWeekFolder}`,
         body: `Automated merge of journal entries for ${currentWeekFolder}.`,
         head: branchName,
         base: "main"
     });
+
+    if (!createPrRes.ok) {
+        const errData = await createPrRes.json() as any;
+        if (errData.errors && errData.errors[0]?.message?.includes("No commits between")) {
+            return "✅ Main is already up to date with your latest entries!";
+        }
+    }
 
     const openPrsRes = await githubFetch(`${API_BASE}/pulls?state=open`, token);
     if (!openPrsRes.ok) {
@@ -236,18 +281,18 @@ export async function mergePendingPullRequests(token: string, currentWeekFolder:
     const openPrs = await openPrsRes.json() as any[];
 
     if (openPrs.length === 0) {
-        return "✅ Everything is up to date! No pending PRs or unmerged commits.";
+        return "✅ Everything is up to date! No pending PRs to merge.";
     }
 
     for (const pr of openPrs) {
         const mergeRes = await githubFetch(`${API_BASE}/pulls/${pr.number}/merge`, token, "PUT", {
-            merge_method: "squash"
+            merge_method: "merge"
         });
 
         if (mergeRes.ok) {
-            results.push(`✅ Merged: ${pr.title}`);
+            results.push(`✅ Merged PR #${pr.number}: ${pr.title}`);
         } else {
-            results.push(`❌ Failed to merge: ${pr.title}`);
+            results.push(`❌ Failed to merge PR #${pr.number}: ${pr.title}`);
         }
     }
 
