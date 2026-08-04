@@ -6,7 +6,7 @@
 
 import type { Env } from "./types";
 import { sendTelegramMessage, editTelegramMessage, answerCallbackQuery, getTelegramFileUrl, downloadTelegramFileAsBase64, logEvent } from "./telegram";
-import { commitToGitHub, updateWeekReadme } from "./github";
+import { commitToGitHub, updateWeekReadme, mergePendingPullRequests } from "./github";
 
 import {
     getDailyCount, incrementAndGetDailyCount, calculateStreak, appendWeeklyEntry, appendRecentEntry, getRecentEntries,
@@ -99,11 +99,20 @@ export async function handleIncomingMessage(payloadMessage: any, chatId: string,
             "/streak — current journaling streak\n" +
             "/quote — generate a quote to commit\n" +
             "/template — choose a structured journaling prompt\n" +
+            "/merge — instantly synchronize and merge all pending entries to main\n" +
             "/recent — links to your last 10 committed entries\n" +
             "/cancel — discard any pending drafts\n" +
             "/help — show this message\n\n" +
             "Or just send text, or a photo with an optional caption, to draft a new journal entry."
         );
+        return;
+    }
+
+    if (originalText === "/merge") {
+        await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, "⏳ Checking for branches and pending PRs...");
+        const paths = getRepoPaths(new Date(), "");
+        const resultMsg = await mergePendingPullRequests(env.GITHUB_TOKEN, paths.weekFolder);
+        await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, resultMsg);
         return;
     }
 
@@ -311,7 +320,8 @@ export async function handleCallbackQuery(callbackQuery: any, chatId: string, en
             imageFileName,
             `Upload asset: ${imageFileName}`,
             base64Image,
-            true
+            true,
+            `week/${finalPaths.weekFolder}`
         );
 
         textToCommit += `\n\n![Visual Context](../assets/${imageFileName})`;
@@ -351,7 +361,8 @@ export async function handleCallbackQuery(callbackQuery: any, chatId: string, en
         finalPaths.fileName,
         commitMessage,
         textToCommit,
-        false
+        false,
+        `week/${finalPaths.weekFolder}`
     );
 
     if (result.success) {
