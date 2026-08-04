@@ -6,6 +6,108 @@
 
 import { getKabulDateString } from "./utils";
 
+import { Env, UserStats } from "./types";
+
+// --- ADD THESE TO THE BOTTOM OF src/kv.ts ---
+
+export async function getUserStats(env: Env, chatId: number): Promise<UserStats> {
+  const stats = await env.JOURNAL_KV.get(`user-stats:${chatId}`, "json");
+  if (stats) return stats as UserStats;
+
+  // Default fresh stats
+  return {
+    totalEntries: 0,
+    longestStreak: 0,
+    currentStreak: 0,
+    lastEntryDate: "",
+    wordsThisMonth: 0,
+    wordsLastMonth: 0,
+    currentMonth: "",
+    wordsThisWeek: 0,
+    wordsLastWeek: 0,
+    currentWeek: "",
+    activeWeekdays: { "0": 0, "1": 0, "2": 0, "3": 0, "4": 0, "5": 0, "6": 0 }
+  };
+}
+
+// Helper to get ISO week string (e.g., "2026-W32")
+function getWeekString(date: Date): string {
+  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  const weekNo = Math.ceil((((d.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
+  return `${d.getUTCFullYear()}-W${weekNo.toString().padStart(2, '0')}`;
+}
+
+export async function updateUserStats(
+  env: Env,
+  chatId: number,
+  wordCount: number,
+  dateObj: Date = new Date()
+): Promise<{ stats: UserStats, isNewMilestone: boolean }> {
+
+  const stats = await getUserStats(env, chatId);
+
+  const dateStr = dateObj.toISOString().split("T")[0]; // YYYY-MM-DD
+  const monthStr = dateStr.substring(0, 7);            // YYYY-MM
+  const weekStr = getWeekString(dateObj);
+  const dayOfWeek = dateObj.getDay().toString();       // "0" to "6"
+
+  let isNewMilestone = false;
+  const milestones = [7, 30, 100, 365];
+
+  stats.totalEntries += 1;
+  stats.activeWeekdays[dayOfWeek] += 1;
+
+  // Month rollover
+  if (stats.currentMonth !== monthStr) {
+    stats.wordsLastMonth = stats.currentMonth ? stats.wordsThisMonth : 0;
+    stats.wordsThisMonth = 0;
+    stats.currentMonth = monthStr;
+  }
+  stats.wordsThisMonth += wordCount;
+
+  // Week rollover
+  if (stats.currentWeek !== weekStr) {
+    stats.wordsLastWeek = stats.currentWeek ? stats.wordsThisWeek : 0;
+    stats.wordsThisWeek = 0;
+    stats.currentWeek = weekStr;
+  }
+  stats.wordsThisWeek += wordCount;
+
+  // Streak calculation
+  if (stats.lastEntryDate !== dateStr) {
+    if (stats.lastEntryDate) {
+      const lastDate = new Date(stats.lastEntryDate);
+      const diffTime = Math.abs(dateObj.getTime() - lastDate.getTime());
+      const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+      if (diffDays === 1) {
+        stats.currentStreak += 1;
+      } else {
+        stats.currentStreak = 1; // Streak broken
+      }
+    } else {
+      stats.currentStreak = 1; // First ever entry
+    }
+
+    stats.lastEntryDate = dateStr;
+
+    if (stats.currentStreak > stats.longestStreak) {
+      stats.longestStreak = stats.currentStreak;
+    }
+
+    if (milestones.includes(stats.currentStreak)) {
+      isNewMilestone = true;
+    }
+  }
+
+  await env.JOURNAL_KV.put(`user-stats:${chatId}`, JSON.stringify(stats));
+
+  return { stats, isNewMilestone };
+}
+
 /**
  * Retrieves the number of journal entries made on a specific date.
  */
