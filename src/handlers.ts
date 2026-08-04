@@ -76,10 +76,26 @@ export async function handleIncomingMessage(payloadMessage: any, chatId: string,
         return;
     }
 
+    // if (originalText === "/help") {
+    //     await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId,
+    //         "📖 Commands:\n" +
+    //         "/stats — today's entry count\n" +
+    //         "/streak — current journaling streak\n" +
+    //         "/quote — generate a quote to commit\n" +
+    //         "/template — choose a structured journaling prompt\n" +
+    //         "/recent — links to your last 10 committed entries\n" +
+    //         "/cancel — discard any pending drafts\n" +
+    //         "/help — show this message\n\n" +
+    //         "Or just send text, or a photo with an optional caption, to draft a new journal entry."
+    //     );
+    //     return;
+    // }
+
+
     if (originalText === "/help") {
         await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId,
             "📖 Commands:\n" +
-            "/stats — today's entry count\n" +
+            "/stats — view your full stats and word counts\n" +
             "/streak — current journaling streak\n" +
             "/quote — generate a quote to commit\n" +
             "/template — choose a structured journaling prompt\n" +
