@@ -105,7 +105,7 @@ export async function commitToGitHub(token: string, folderName: string, fileName
 
     const filePath = folderName ? `${folderName}/${fileName}` : fileName;
     const encodedPath = filePath.split('/').map(segment => encodeURIComponent(segment)).join('/');
-    const repoUrl = `[https://api.github.com/repos/YaserZarifi/daily-dev-journal/contents/$](https://api.github.com/repos/YaserZarifi/daily-dev-journal/contents/$){encodedPath}`;
+    const repoUrl = `https://api.github.com/repos/YaserZarifi/daily-dev-journal/contents/${encodedPath}`;
 
     const headers = {
         "Authorization": `Bearer ${token}`,
