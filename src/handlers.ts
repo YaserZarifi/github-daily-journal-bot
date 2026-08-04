@@ -7,10 +7,11 @@
 import type { Env } from "./types";
 import { sendTelegramMessage, editTelegramMessage, answerCallbackQuery, getTelegramFileUrl, downloadTelegramFileAsBase64, logEvent } from "./telegram";
 import { commitToGitHub, updateWeekReadme } from "./github";
+
 import {
     getDailyCount, incrementAndGetDailyCount, calculateStreak, appendWeeklyEntry, appendRecentEntry, getRecentEntries,
     setPendingEntry, getPendingEntry, clearPendingEntry,
-    setAwaitingCustomMood, isAwaitingCustomMood, clearAwaitingCustomMood
+    setAwaitingCustomMood, isAwaitingCustomMood, clearAwaitingCustomMood, getUserStats, updateUserStats
 } from "./kv";
 import { refineTextWithAI, generateQuoteWithAI, correctTextWithAI, suggestTagsWithAI } from "./ai";
 import { getRepoPaths, truncateForTelegram, buildCorrectedBlock } from "./utils";
@@ -31,10 +32,18 @@ export async function handleIncomingMessage(payloadMessage: any, chatId: string,
         return;
     }
 
+    // if (originalText === "/stats") {
+    //     const paths = getRepoPaths(new Date(), "");
+    //     const count = await getDailyCount(env.JOURNAL_KV, paths.fileDate);
+    //     await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, `📊 You have committed ${count} journal entries today!`);
+    //     return;
+    // }
     if (originalText === "/stats") {
         const paths = getRepoPaths(new Date(), "");
         const count = await getDailyCount(env.JOURNAL_KV, paths.fileDate);
-        await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, `📊 You have committed ${count} journal entries today!`);
+        const stats = await getUserStats(env, chatId);
+        const message = `📊 Your Journal Stats\n\n📝 Today's Entries: ${count}\n🔥 Current Streak: ${stats.currentStreak} days\n🏆 Longest Streak: ${stats.longestStreak} days\n📚 Total Entries: ${stats.totalEntries}\n\n📈 Words this week: ${stats.wordsThisWeek}\n📅 Words this month: ${stats.wordsThisMonth}`;
+        await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, message);
         return;
     }
 
@@ -286,6 +295,15 @@ export async function handleCallbackQuery(callbackQuery: any, chatId: string, en
         if (draft.original !== "/quote") {
             await appendWeeklyEntry(env.JOURNAL_KV, finalPaths.weekFolder, finalPaths.fileDate, textToCommit);
             await updateWeekReadme(env, finalPaths.weekFolder);
+        }
+
+        const wordCount = textToCommit.trim().split(/\s+/).length;
+        const { stats, isNewMilestone } = await updateUserStats(env, chatId, wordCount);
+
+        if (isNewMilestone) {
+            await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, `🎉 *Milestone Unlocked!* You've hit a ${stats.currentStreak}-day journaling streak! Keep up the amazing work!`, "Markdown");
+        } else if (stats.wordsThisWeek > stats.wordsLastWeek && stats.wordsLastWeek > 0) {
+            await sendTelegramMessage(env.TELEGRAM_TOKEN, chatId, `🚀 Nice! You've already written more words this week (${stats.wordsThisWeek}) than last week (${stats.wordsLastWeek}).`);
         }
     } else {
         await editTelegramMessage(env.TELEGRAM_TOKEN, chatId, messageId, `Failed to commit! ${truncateForTelegram(result.error ?? "GitHub responded with an error.")}`);

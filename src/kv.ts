@@ -10,7 +10,7 @@ import { Env, UserStats } from "./types";
 
 // --- ADD THESE TO THE BOTTOM OF src/kv.ts ---
 
-export async function getUserStats(env: Env, chatId: number): Promise<UserStats> {
+export async function getUserStats(env: Env, chatId: string): Promise<UserStats> {
   const stats = await env.JOURNAL_KV.get(`user-stats:${chatId}`, "json");
   if (stats) return stats as UserStats;
 
@@ -42,7 +42,7 @@ function getWeekString(date: Date): string {
 
 export async function updateUserStats(
   env: Env,
-  chatId: number,
+  chatId: string,
   wordCount: number,
   dateObj: Date = new Date()
 ): Promise<{ stats: UserStats, isNewMilestone: boolean }> {
